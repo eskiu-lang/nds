@@ -130,6 +130,13 @@ expected audio for them was rendered by the Tallgrass engine. On macOS the rende
 match exactly; elsewhere the C library's `exp2`, `powf`, `log10` and `sin` may round a
 last bit differently, so the tests allow a difference of 2 in a 16-bit sample.
 
+## Platforms
+
+The package is plain Eskiu with no native library, so it builds for every target Eskiu has:
+macOS, Linux and Windows, iOS and Android, WebAssembly, and freestanding builds. Its tests
+pass on macOS, Linux and Windows in CI, under node as WebAssembly (emscripten) and on an
+Android arm64 emulator.
+
 ## Install
 
 ```toml
