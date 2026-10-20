@@ -1,0 +1,124 @@
+// The PNG writer: chunks, CRCs and the stored zlib stream read back with a
+// separate (bitwise) CRC and Adler-32, for images small and large enough
+// to need several stored blocks. And the WAV header of a tiny buffer.
+import <io>;
+import <mem>;
+import <bytes>;
+import <nds/image>;
+import <nds/wav>;
+
+int fails = 0;
+
+void check(bool ok, string what) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+uint32 be32(*uint8 p) {
+    return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | (uint32)p[3];
+}
+
+uint32 crc_bitwise(*uint8 p, int64 n) {
+    uint32 c = (uint32)0xFFFFFFFF;
+    for (int64 i = 0; i < n; i++) {
+        c = c ^ (uint32)p[i];
+        for (k in 0..8) {
+            if ((c & (uint32)1) != 0) {
+                c = (c >> 1) ^ (uint32)0xEDB88320;
+            } else {
+                c = c >> 1;
+            }
+        }
+    }
+    return ~c;
+}
+
+// Reads a PNG made of IHDR, IDAT with stored blocks, IEND; compares the
+// pixels with img.
+bool read_back(Bytes* b, NdsImage* img) {
+    *uint8 p = b.data;
+    uint8[8] sig = {137, 80, 78, 71, 13, 10, 26, 10};
+    if (b.len < 8 || memcmp((*void)p, (*void)&sig[0], 8) != 0) return false;
+    int64 at = 8;
+    let raw: Bytes;
+    raw.init(1024);
+    defer raw.free();
+    bool ended = false;
+    while (at + 12 <= b.len) {
+        int64 n = (int64)be32(p + at);
+        if (at + 12 + n > b.len) return false;
+        if (crc_bitwise(p + at + 4, n + 4) != be32(p + at + 8 + n)) return false;
+        *uint8 kind = p + at + 4;
+        *uint8 data = p + at + 8;
+        if (memcmp((*void)kind, (*void)"IHDR", 4) == 0) {
+            if (n != 13 || be32(data) != (uint32)img.width || be32(data + 4) != (uint32)img.height || data[8] != 8 || data[9] != 6) return false;
+        } else if (memcmp((*void)kind, (*void)"IDAT", 4) == 0) {
+            if (data[0] != 0x78 || ((int)data[0] * 256 + (int)data[1]) % 31 != 0) return false;
+            int64 q = 2;
+            bool last = false;
+            while (!last) {
+                if (q + 5 > n) return false;
+                last = (data[q] & 1) != 0;
+                if ((data[q] & 6) != 0) return false;
+                int64 len = (int64)data[q + 1] | ((int64)data[q + 2] << 8);
+                int64 nlen = (int64)data[q + 3] | ((int64)data[q + 4] << 8);
+                if ((len ^ nlen) != 0xFFFF || q + 5 + len > n) return false;
+                raw.append_raw(data + q + 5, len);
+                q += 5 + len;
+            }
+            uint32 s1 = 1;
+            uint32 s2 = 0;
+            for (int64 i = 0; i < raw.len; i++) {
+                s1 = (s1 + (uint32)raw.data[i]) % (uint32)65521;
+                s2 = (s2 + s1) % (uint32)65521;
+            }
+            if (q + 4 != n || be32(data + q) != ((s2 << 16) | s1)) return false;
+        } else if (memcmp((*void)kind, (*void)"IEND", 4) == 0) {
+            ended = n == 0;
+        }
+        at += 12 + n;
+    }
+    int64 row = (int64)img.width * 4 + 1;
+    if (!ended || at != b.len || raw.len != row * (int64)img.height) return false;
+    for (y in 0..img.height) {
+        if (raw.data[(int64)y * row] != 0) return false;
+        if (memcmp((*void)(raw.data + (int64)y * row + 1), (*void)(img.rgba + (int64)y * (int64)img.width * 4), row - 1) != 0) return false;
+    }
+    return true;
+}
+
+void png(int w, int h) {
+    NdsImage img = NdsImage_new(w, h);
+    for (y in 0..h) {
+        for (x in 0..w) img.set(x, y, x * 7 + y, y * 3, (x ^ y) & 255, (x + y) & 255);
+    }
+    Bytes b = img.png_bytes();
+    if (!read_back(&b, &img)) {
+        printf("  %dx%d\n", w, h);
+        check(false, "PNG read back");
+    }
+    b.free();
+    img.free();
+}
+
+png(1, 1);
+png(3, 2);
+png(64, 64);
+png(200, 150);
+png(0, 0);
+NdsImage one = NdsImage_new(2, 2);
+one.set(1, 0, 10, 20, 30, 40);
+check(one.get(1, 0) == (uint32)0x281E140A && one.get(0, 0) == 0 && one.get(5, 5) == 0, "get and set");
+one.set(-1, 9, 1, 1, 1, 1);
+one.free();
+
+int16[4] s = {1, -1, 32767, -32768};
+Bytes w = wav_bytes(&s[0], 2, 2, 48000);
+check(w.len == 52 && memcmp((*void)w.data, (*void)"RIFF", 4) == 0 && w.data[4] == 44 && memcmp((*void)(w.data + 8), (*void)"WAVEfmt ", 8) == 0, "WAV header");
+check(w.data[22] == 2 && w.data[24] == 0x80 && w.data[25] == 0xBB && w.data[32] == 4 && w.data[34] == 16 && w.data[40] == 8, "WAV format fields");
+check(w.data[44] == 1 && w.data[45] == 0 && w.data[46] == 0xFF && w.data[47] == 0xFF && w.data[50] == 0 && w.data[51] == 0x80, "WAV samples");
+w.free();
+if (fails > 0) return 1;
+printf("image: ok\n");

@@ -1,0 +1,178 @@
+// The synthesizer against the Tallgrass engine's output for the synthetic
+// SDAT of tools/gen_test_data.py: names, decoded waves, two renders (one
+// that ends at the song's loop point, one that loops) compared sample by
+// sample, rendering in blocks of any size, and the errors.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <nds/bin>;
+import <nds/sdat>;
+import <nds/wav>;
+
+int fails = 0;
+
+void check(bool ok, string what) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+*uint8 slurp(string name, *int64 n) {
+    let p: Bytes;
+    p.init(64);
+    p.append_raw((*uint8)"tests/data/", 11);
+    p.append_raw((*uint8)name, strlen(name));
+    p.push(0);
+    *uint8 d = fs_read_all((string)p.data, n);
+    p.free();
+    return d;
+}
+
+// Largest difference between pcm and the samples of a reference WAV; -1 when
+// the lengths differ.
+int compare_wav(Pcm16* pcm, string name) {
+    int64 n = 0;
+    *uint8 w = slurp(name, &n);
+    if (w == null) return -1;
+    defer free((*void)w);
+    int64 count = (n - 44) / 2;
+    if (count != pcm.frames * 2) {
+        printf("  %s: %lld samples, rendered %lld\n", name, count, pcm.frames * 2);
+        return -1;
+    }
+    int worst = 0;
+    for (int64 i = 0; i < count; i++) {
+        int ref = (int)(int16)(uint16)((int)w[44 + i * 2] | ((int)w[45 + i * 2] << 8));
+        int d = ref - (int)pcm.data[i];
+        if (d < 0) d = -d;
+        if (d > worst) worst = d;
+    }
+    return worst;
+}
+
+// Same libm as the engine on macOS: exact. Elsewhere exp2, powf, log10 and
+// sin may round their last bit differently.
+int tolerance() {
+#ifdef __APPLE__
+    return 0;
+#else
+    return 2;
+#endif
+}
+
+Result<int, string> run() {
+    Sdat s = Sdat_open("tests/data/test.sdat")?;
+    defer s.close();
+    check(s.seq_count() == 4, "four sequence slots");
+    check(s.seq_find("SEQ_TEST") == 0 && s.seq_find("SEQ_LOOP") == 2 && s.seq_find("SEQ_NO_BANK") == 3, "names");
+    check(s.seq_find("SEQ_NONE") == -1, "a missing name");
+    check(s.seq_name(1) == null && strcmp(s.seq_name(2), "SEQ_LOOP") == 0, "seq_name");
+    check(s.has_seq(0) && !s.has_seq(1) && !s.has_seq(9), "has_seq");
+    check(s.wavearc_count() == 1 && s.wavearc_find("WAVE_ARC_TEST") == 0, "wave archive name");
+
+    // waves: wave K is waveK.pcm, with its rate, loop flag and loop start
+    int[3] rates = {16384, 22050, 32000};
+    bool[3] loops = {true, false, true};
+    int[3] starts = {8, 0, 192};
+    for (k in 0..3) {
+        SdatWave w = s.wave(0, k)?;
+        int64 n = 0;
+        uint8[16] name;
+        sprintf(&name[0], "wave%d.pcm", k);
+        *uint8 ref = slurp((string)&name[0], &n);
+        bool same = ref != null && n == w.len * 2;
+        for (int64 i = 0; same && i < w.len; i++) {
+            if ((int16)(uint16)((int)ref[i * 2] | ((int)ref[i * 2 + 1] << 8)) != w.pcm[i]) same = false;
+        }
+        check(same, "wave samples");
+        check(w.rate == (double)rates[k] && w.looped == loops[k] && w.loop_start == (int64)starts[k], "wave rate and loop");
+        if (ref != null) free((*void)ref);
+        w.free();
+    }
+    check(!s.wave(0, 3).ok && !s.wave(1, 0).ok, "missing waves are errors");
+
+    // render once: ends at the loop point, before the 8 seconds
+    Pcm16 pcm;
+    int64 frames = s.render_name("SEQ_TEST", 8.0, &pcm)?;
+    check(frames > 48000 * 4 && frames < 48000 * 8, "the render ends at the song's loop");
+    int d = compare_wav(&pcm, "seq_test.wav");
+    if (d != 0) printf("  SEQ_TEST: largest difference %d\n", d);
+    check(d >= 0 && d <= tolerance(), "SEQ_TEST matches the engine");
+    Bytes wav = pcm.wav_bytes();
+    int64 n = 0;
+    *uint8 ref = slurp("seq_test.wav", &n);
+    check(ref != null && n == wav.len && memcmp((*void)ref, (*void)wav.data, 44) == 0, "WAV header");
+    if (ref != null) free((*void)ref);
+    wav.free();
+
+    // the same in blocks of odd sizes, as a real-time player renders it
+    SdatPlayer p = SdatPlayer_open(&s, 0, false)?;
+    *int16 blocks = alloc<int16>(pcm.frames * 2 + 2);
+    int64 at = 0;
+    int[5] sizes = {1, 7, 333, 4096, 50};
+    int k = 0;
+    while (true) {
+        int64 got = p.render(blocks + at * 2, (int64)sizes[k % 5]);
+        at += got;
+        k++;
+        if (got < (int64)sizes[(k - 1) % 5]) break;
+    }
+    check(at == pcm.frames && p.is_done(), "blocks end where the whole render does");
+    check(memcmp((*void)blocks, (*void)pcm.data, at * 4) == 0, "blocks give the same samples");
+    free((*void)blocks);
+    p.free();
+    pcm.free();
+
+    // the float render is the 16-bit one before the conversion
+    SdatPlayer pf = SdatPlayer_open(&s, 0, false)?;
+    SdatPlayer pi = SdatPlayer_open(&s, 0, false)?;
+    *float f = alloc<float>(2000);
+    *int16 q = alloc<int16>(2000);
+    pf.render_f32(f, 1000);
+    pi.render(q, 1000);
+    bool same = true;
+    float scale = 32767.0;
+    for (i in 0..2000) {
+        if ((int16)(f[i] * scale) != q[i]) same = false;
+    }
+    check(same, "render_f32 and render agree");
+    free((*void)f);
+    free((*void)q);
+    pf.free();
+    pi.free();
+
+    // looping: plays through the jump back for the whole time
+    SdatPlayer lp = SdatPlayer_open_name(&s, "SEQ_LOOP", true)?;
+    Pcm16 loop = Pcm16{data: alloc<int16>(48000 * 3 * 2), frames: 0, channels: 2, rate: 48000};
+    loop.frames = lp.render(loop.data, 48000 * 3);
+    check(loop.frames == 48000 * 3 && !lp.is_done(), "a looping player does not end");
+    d = compare_wav(&loop, "seq_loop.wav");
+    if (d != 0) printf("  SEQ_LOOP: largest difference %d\n", d);
+    check(d >= 0 && d <= tolerance(), "SEQ_LOOP matches the engine");
+    lp.free();
+    loop.free();
+
+    // errors
+    Result<SdatPlayer, string> e = SdatPlayer_open(&s, 3, false);
+    check(!e.ok && strcmp(e.error, "sdat: the sequence's bank is missing") == 0, "a sequence without a bank");
+    check(!SdatPlayer_open(&s, 1, false).ok && !SdatPlayer_open(&s, 7, false).ok && !SdatPlayer_open(&s, -1, false).ok, "missing sequences");
+    check(!SdatPlayer_open_name(&s, "SEQ_NONE", false).ok, "a missing name");
+    Pcm16 none;
+    check(!s.render_name("SEQ_NONE", 1.0, &none).ok && none.data == null, "render of a missing name");
+    uint8[8] junk = {1, 2, 3, 4, 5, 6, 7, 8};
+    check(!Sdat_from(&junk[0], 8).ok, "not an SDAT");
+    check(!Sdat_open("tests/data/missing.sdat").ok, "a missing file");
+    return Ok<int, string>(0);
+}
+
+Result<int, string> r = run();
+if (!r.ok) {
+    printf("FAIL %s\n", r.error);
+    fails++;
+}
+
+if (fails > 0) return 1;
+printf("sdat: ok\n");

@@ -1,0 +1,159 @@
+// NSBTX textures in each of the seven formats and an NSBMD's materials and
+// triangles, against tools/gen_test_data.py's expectations
+// (tests/data/textures.txt, model.txt and the .rgba files).
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <math>;
+import <nds/bin>;
+import <nds/image>;
+import <nds/model>;
+
+extern int atoi(string s);
+extern double atof(string s);
+
+int fails = 0;
+
+void check(bool ok, string what) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+NdsData slurp(string name) {
+    let p: Bytes;
+    p.init(64);
+    p.append_raw((*uint8)"tests/data/", 11);
+    p.append_raw((*uint8)name, strlen(name));
+    p.push(0);
+    int64 n = 0;
+    *uint8 d = fs_read_all((string)p.data, &n);
+    p.free();
+    return NdsData{data: d, len: n};
+}
+
+bool same_image(NdsImage* img, string name) {
+    NdsData e = slurp(name);
+    if (e.data == null) return false;
+    defer free((*void)e.data);
+    if (e.u32(0) != (int64)img.width || e.u32(4) != (int64)img.height) return false;
+    int64 n = (int64)img.width * (int64)img.height * 4;
+    return e.len == n + 8 && memcmp((*void)(e.data + 8), (*void)img.rgba, n) == 0;
+}
+
+// The words of each line of a text file (at most 16 lines of 16 words).
+int split(NdsData* t, *string out, int max_words) {
+    int n = 0;
+    int64 i = 0;
+    while (i < t.len && n < max_words) {
+        while (i < t.len && (t.data[i] == 32 || t.data[i] == 10)) {
+            t.data[i] = 0;
+            i++;
+        }
+        if (i >= t.len) break;
+        out[n] = (string)(t.data + i);
+        n++;
+        while (i < t.len && t.data[i] != 32 && t.data[i] != 10) i++;
+    }
+    if (i < t.len) t.data[i] = 0;
+    return n;
+}
+
+void textures() {
+    NdsData d = slurp("test.nsbtx");
+    defer free((*void)d.data);
+    Result<NdsTexSet, string> r = nds_texset(d.data, d.len);
+    if (!r.ok) {
+        check(false, r.error);
+        return;
+    }
+    NdsTexSet ts = r.value;
+    defer ts.free();
+    check(ts.ntex == 7 && ts.npal == 6, "texture and palette counts");
+    NdsData list = slurp("textures.txt");
+    defer free((*void)list.data);
+    *string w = alloc<string>(256);
+    defer free((*void)w);
+    int n = split(&list, w, 256);
+    for (int k = 0; k + 5 < n + 1; k += 6) {
+        int t = ts.find(w[k + 1]);
+        check(t >= 0, "a texture by name");
+        if (t < 0) continue;
+        check(ts.tex[t].format == atoi(w[k + 2]) && ts.tex[t].width == atoi(w[k + 3]) && ts.tex[t].height == atoi(w[k + 4]), "texture format and size");
+        int p = ts.palette_for(t);
+        check(ts.tex[t].format == NDS_TEX_DIRECT || (p >= 0 && strcmp(ts.pal[p].name, ts.tex[t].name) == 0), "the palette of the same name");
+        Result<NdsImage, string> img = ts.image(t, ts.tex[t].format == NDS_TEX_DIRECT ? -1 : p);
+        if (!img.ok) {
+            check(false, img.error);
+            continue;
+        }
+        if (!same_image(&img.value, w[k + 5])) {
+            printf("  texture %s (format %s)\n", w[k + 1], w[k + 2]);
+            check(false, "texture pixels");
+        }
+        img.value.free();
+    }
+    check(!ts.image(7, 0).ok && !ts.image(-1, 0).ok, "a missing texture");
+    check(ts.find("nope") == -1 && ts.find_palette("nope") == -1, "missing names");
+}
+
+void model() {
+    NdsData d = slurp("test.nsbmd");
+    defer free((*void)d.data);
+    Result<NdsModel, string> r = nsbmd_read(d.data, d.len);
+    if (!r.ok) {
+        check(false, r.error);
+        return;
+    }
+    NdsModel m = r.value;
+    defer m.free();
+    check(strcmp(m.name, "testmodel") == 0 && m.scale == (float)2.0, "model name and scale");
+    check(m.nmaterials == 2 && strcmp(m.materials[0].name, "mat_floor") == 0 && strcmp(m.materials[1].texture, "four") == 0 && strcmp(m.materials[0].palette, "sixteen") == 0, "materials");
+    check(m.groups.size == 2 && m.triangles() == 5, "groups and triangles");
+    NdsData list = slurp("model.txt");
+    defer free((*void)list.data);
+    *string w = alloc<string>(512);
+    defer free((*void)w);
+    int n = split(&list, w, 512);
+    int[2] seen = {0, 0};
+    bool ok = true;
+    for (int k = 4; k + 11 < n + 1; k += 12) {
+        int mat = atoi(w[k + 1]);
+        NdsMeshGroup* g = &m.groups.data[mat];
+        if (g.material != mat || strcmp(m.materials[mat].texture, w[k + 2]) != 0) ok = false;
+        int t = seen[mat];
+        seen[mat]++;
+        if ((t + 1) * 3 > g.verts.size) {
+            ok = false;
+            continue;
+        }
+        for (j in 0..3) {
+            NdsVertex* v = &g.verts.data[t * 3 + j];
+            double x = atof(w[k + 3 + j * 3]);
+            double y = atof(w[k + 4 + j * 3]);
+            double z = atof(w[k + 5 + j * 3]);
+            if (fabs((double)v.x - x) > 1e-5 || fabs((double)v.y - y) > 1e-5 || fabs((double)v.z - z) > 1e-5) ok = false;
+        }
+    }
+    check(ok && seen[0] == 2 && seen[1] == 3, "triangles");
+    NdsVertex* q = &m.groups.data[0].verts.data[1];
+    check(m.groups.data[0].has_normals && m.groups.data[0].has_colors && !m.groups.data[1].has_normals, "normals and colors");
+    check(q.s == (float)4.0 && q.t == (float)6.0 && q.r == (float)1.0 && fabs((double)q.ny - 0.998046875) < 1e-6, "texture coordinates, color, normal");
+    // the model's own textures, paired by its materials
+    Result<NdsTexSet, string> ts = nds_texset(d.data, d.len);
+    check(ts.ok && ts.value.ntex == 7, "the model's texture block");
+    if (ts.ok) {
+        int t = ts.value.find("four");
+        check(strcmp(ts.value.pal[m.palette_for(&ts.value, t)].name, "four") == 0, "material palette pairing");
+        ts.value.free();
+    }
+    check(!nsbmd_read(d.data, 64).ok, "a truncated model");
+}
+
+textures();
+model();
+if (fails > 0) return 1;
+printf("model: ok\n");

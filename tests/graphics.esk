@@ -1,0 +1,124 @@
+// 2D graphics: palettes, tiled and linear tiles, a screen with flips and
+// palettes, and cells, against the pixels tools/gen_test_data.py computed
+// from the values it encoded.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <nds/bin>;
+import <nds/image>;
+import <nds/graphics>;
+
+int fails = 0;
+
+void check(bool ok, string what) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+NdsData slurp(string name) {
+    let p: Bytes;
+    p.init(64);
+    p.append_raw((*uint8)"tests/data/", 11);
+    p.append_raw((*uint8)name, strlen(name));
+    p.push(0);
+    int64 n = 0;
+    *uint8 d = fs_read_all((string)p.data, &n);
+    p.free();
+    return NdsData{data: d, len: n};
+}
+
+// img against an expected .rgba file (width, height, pixels).
+bool same_image(NdsImage* img, string name) {
+    NdsData e = slurp(name);
+    if (e.data == null) return false;
+    defer free((*void)e.data);
+    if (e.u32(0) != (int64)img.width || e.u32(4) != (int64)img.height) {
+        printf("  %s: %dx%d, expected %lldx%lld\n", name, img.width, img.height, e.u32(0), e.u32(4));
+        return false;
+    }
+    int64 n = (int64)img.width * (int64)img.height * 4;
+    if (e.len != n + 8) return false;
+    return n == 0 || memcmp((*void)(e.data + 8), (*void)img.rgba, n) == 0;
+}
+
+Result<int, string> run() {
+    NdsData pd = slurp("test.nclr");
+    defer free((*void)pd.data);
+    NdsPalette pal = nclr_read(pd.data, pd.len)?;
+    defer pal.free();
+    check(pal.count == 64, "palette size");
+    check(pal.color(64) == 0xFF00FF && pal.color(-1) == 0xFF00FF, "colors past the palette are magenta");
+
+    NdsData t4 = slurp("tiles4.ncgr");
+    defer free((*void)t4.data);
+    NdsTiles tiles = ncgr_read(t4.data, t4.len)?;
+    defer tiles.free();
+    check(tiles.bpp == 4 && tiles.count == 12 && tiles.tiles_w == 4 && tiles.tiles_h == 3 && !tiles.linear, "4-bit tile header");
+    NdsImage sheet = tiles.sheet(&pal, 32, 0);
+    check(same_image(&sheet, "tiles4_sheet.rgba"), "4-bit tile sheet");
+    sheet.free();
+
+    NdsData t8 = slurp("tiles8.ncgr");
+    defer free((*void)t8.data);
+    NdsTiles tiles8 = ncgr_read(t8.data, t8.len)?;
+    defer tiles8.free();
+    check(tiles8.bpp == 8 && tiles8.count == 3 && tiles8.tiles_w == -1, "8-bit tile header");
+    NdsImage sheet8 = tiles8.sheet(&pal, 32, 0);
+    check(same_image(&sheet8, "tiles8_sheet.rgba"), "8-bit tile sheet");
+    sheet8.free();
+
+    NdsData tl = slurp("linear.ncgr");
+    defer free((*void)tl.data);
+    NdsTiles lin = ncgr_read(tl.data, tl.len)?;
+    defer lin.free();
+    check(lin.linear, "a linear NCGR");
+    NdsImage bitmap = lin.sheet(&pal, 32, 0);
+    check(same_image(&bitmap, "linear_sheet.rgba"), "linear bitmap");
+    bitmap.free();
+
+    NdsData sd = slurp("screen.nscr");
+    defer free((*void)sd.data);
+    NdsScreen scr = nscr_read(sd.data, sd.len)?;
+    defer scr.free();
+    check(scr.width == 32 && scr.height == 24 && scr.count == 12, "screen header");
+    NdsImage s0 = nds_render_screen(&scr, &tiles, &pal, false);
+    NdsImage s1 = nds_render_screen(&scr, &tiles, &pal, true);
+    check(same_image(&s0, "screen_t0.rgba"), "screen, color 0 drawn");
+    check(same_image(&s1, "screen_t1.rgba"), "screen, color 0 transparent");
+    s0.free();
+    s1.free();
+
+    NdsData cd = slurp("cells.ncer");
+    defer free((*void)cd.data);
+    NdsCells cells = ncer_read(cd.data, cd.len)?;
+    defer cells.free();
+    check(cells.count == 2 && cells.n[0] == 2 && cells.n[1] == 2 && cells.mapping == 0, "cell header");
+    NdsOam* o = cells.oam(0, 1);
+    check(o.x == 0 && o.y == 4 && o.w == 16 && o.h == 8 && o.tile == 4 && o.hflip && !o.vflip && o.palette == 2, "an object's attributes");
+    o = cells.oam(1, 0);
+    check(o.x == -4 && o.y == -12 && o.w == 8 && o.h == 16 && o.vflip && !o.hflip, "a negative position");
+    NdsImage c0 = cells.render(0, &tiles, &pal);
+    NdsImage c1 = cells.render(1, &tiles, &pal);
+    check(same_image(&c0, "cell0.rgba"), "cell 0");
+    check(same_image(&c1, "cell1.rgba"), "cell 1");
+    c0.free();
+    c1.free();
+
+    // errors
+    check(!nclr_read(t4.data, t4.len).ok && !ncgr_read(pd.data, pd.len).ok && !nscr_read(pd.data, pd.len).ok && !ncer_read(pd.data, pd.len).ok, "the wrong file type");
+    check(!ncgr_read(t4.data, 20).ok, "a file cut before its block");
+    return Ok<int, string>(0);
+}
+
+Result<int, string> r = run();
+if (!r.ok) {
+    printf("FAIL %s\n", r.error);
+    fails++;
+}
+
+if (fails > 0) return 1;
+printf("graphics: ok\n");

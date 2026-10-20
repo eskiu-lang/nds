@@ -1,0 +1,221 @@
+// Hostile input: every truncation of the test files and random byte flips
+// must give an error or a result, never a crash or a read outside the
+// buffer. Each input goes into a buffer of its own size, so a read past the
+// end shows up under --asan. ITERATIONS is small for the test suite; raise
+// it for a longer run:
+//
+//     eskiuc --asan --safe tests/corrupt.esk -o build/corrupt && build/corrupt 20000
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <nds/bin>;
+import <nds/lz>;
+import <nds/narc>;
+import <nds/rom>;
+import <nds/sdat>;
+import <nds/wav>;
+import <nds/image>;
+import <nds/graphics>;
+import <nds/model>;
+
+extern int atoi(string s);
+
+int iterations = 150;
+uint32 seed = 11;
+
+uint32 rnd() {
+    seed = seed ^ (seed << 13);
+    seed = seed ^ (seed >> 17);
+    seed = seed ^ (seed << 5);
+    return seed;
+}
+
+void try_sdat(*uint8 d, int64 n) {
+    Result<Sdat, string> r = Sdat_from(d, n);
+    if (!r.ok) return;
+    Sdat s = r.value;
+    for (i in 0..s.seq_count()) {
+        Result<SdatPlayer, string> p = SdatPlayer_open(&s, i, i % 2 == 0);
+        if (!p.ok) continue;
+        int16[2400] buf;
+        p.value.render(&buf[0], 1200);
+        p.value.free();
+    }
+    for (k in 0..4) {
+        Result<SdatWave, string> w = s.wave(0, k);
+        if (w.ok) w.value.free();
+    }
+    s.close();
+}
+
+void try_narc(*uint8 d, int64 n) {
+    Result<Narc, string> r = Narc_from(d, n);
+    if (!r.ok) return;
+    for (i in 0..r.value.count()) {
+        NdsData f = r.value.file(i);
+        if (f.len > 0) seed = seed + (uint32)f.data[0];
+    }
+    r.value.find("a/0/x.bin");
+    r.value.close();
+}
+
+void try_rom(*uint8 d, int64 n) {
+    Result<NdsRom, string> r = NdsRom_from(d, n);
+    if (!r.ok) return;
+    for (i in 0..r.value.noverlays) {
+        Result<Bytes, string> o = r.value.overlay(r.value.overlays[i].id);
+        if (o.ok) o.value.free();
+    }
+    Result<Narc, string> inner = r.value.narc("data/inner.narc");
+    if (inner.ok) inner.value.close();
+    r.value.close();
+}
+
+void try_lz(*uint8 d, int64 n) {
+    Result<Bytes, string> a = nds_lz_decompress(d, n);
+    if (a.ok) a.value.free();
+    Result<Bytes, string> b = nds_blz_decompress(d, n);
+    if (b.ok) b.value.free();
+}
+
+void try_2d(*uint8 d, int64 n, NdsTiles* tiles, NdsPalette* pal) {
+    Result<NdsPalette, string> p = nclr_read(d, n);
+    if (p.ok) p.value.free();
+    Result<NdsTiles, string> t = ncgr_read(d, n);
+    if (t.ok) {
+        NdsImage img = t.value.sheet(pal, 32, 1);
+        img.free();
+        t.value.free();
+    }
+    Result<NdsScreen, string> s = nscr_read(d, n);
+    if (s.ok) {
+        NdsImage img = nds_render_screen(&s.value, tiles, pal, true);
+        img.free();
+        s.value.free();
+    }
+    Result<NdsCells, string> c = ncer_read(d, n);
+    if (c.ok) {
+        for (i in 0..c.value.count) {
+            NdsImage img = c.value.render(i, tiles, pal);
+            img.free();
+        }
+        c.value.free();
+    }
+}
+
+void try_3d(*uint8 d, int64 n) {
+    Result<NdsTexSet, string> t = nds_texset(d, n);
+    if (t.ok) {
+        for (i in 0..t.value.ntex) {
+            Result<NdsImage, string> img = t.value.image(i, t.value.palette_for(i));
+            if (img.ok) img.value.free();
+        }
+        t.value.free();
+    }
+    Result<NdsModel, string> m = nsbmd_read(d, n);
+    if (m.ok) m.value.free();
+}
+
+void try_all(int kind, *uint8 d, int64 n, NdsTiles* tiles, NdsPalette* pal) {
+    if (kind == 0) try_sdat(d, n);
+    if (kind == 1) try_narc(d, n);
+    if (kind == 2) try_rom(d, n);
+    if (kind == 3) try_lz(d, n);
+    if (kind == 4) try_2d(d, n, tiles, pal);
+    if (kind == 5) try_3d(d, n);
+}
+
+NdsData slurp(string name) {
+    let p: Bytes;
+    p.init(64);
+    p.append_raw((*uint8)"tests/data/", 11);
+    p.append_raw((*uint8)name, strlen(name));
+    p.push(0);
+    int64 n = 0;
+    *uint8 d = fs_read_all((string)p.data, &n);
+    p.free();
+    return NdsData{data: d, len: n};
+}
+
+void file(string name, int kind, NdsTiles* tiles, NdsPalette* pal) {
+    NdsData src = slurp(name);
+    if (src.data == null) {
+        printf("FAIL cannot read %s\n", name);
+        return;
+    }
+    defer free((*void)src.data);
+    // every prefix (every 8th for the larger files)
+    int64 stride = src.len > 2000 ? (int64)8 : (int64)1;
+    for (int64 k = 0; k < src.len; k += stride) {
+        *uint8 cut = alloc<uint8>(k + 1);
+        memcpy((*void)cut, (*void)src.data, k);
+        try_all(kind, cut, k, tiles, pal);
+        free((*void)cut);
+    }
+    *uint8 buf = alloc<uint8>(src.len);
+    defer free((*void)buf);
+    for (it in 0..iterations) {
+        memcpy((*void)buf, (*void)src.data, src.len);
+        int flips = 1 + (int)(rnd() % 6);
+        for (f in 0..flips) {
+            int64 at = (int64)(rnd() % (uint32)src.len);
+            uint32 how = rnd() % 4;
+            if (how == 0) {
+                buf[at] = (uint8)((int)buf[at] ^ (1 + (int)(rnd() % 255)));
+            } else if (how == 1) {
+                buf[at] = 0xFF;
+            } else if (how == 2) {
+                buf[at] = 0;
+            } else {
+                buf[at] = (uint8)((int)buf[at] + 1);
+            }
+        }
+        try_all(kind, buf, src.len, tiles, pal);
+    }
+}
+
+if (argc > 1) iterations = atoi(argv[1]);
+NdsData pd = slurp("test.nclr");
+NdsData td = slurp("tiles4.ncgr");
+Result<NdsPalette, string> pr = nclr_read(pd.data, pd.len);
+Result<NdsTiles, string> tr = ncgr_read(td.data, td.len);
+if (!pr.ok || !tr.ok) {
+    printf("FAIL cannot read the tiles\n");
+    return 1;
+}
+
+NdsPalette pal = pr.value;
+NdsTiles tiles = tr.value;
+file("test.sdat", 0, &tiles, &pal);
+file("plain.narc", 1, &tiles, &pal);
+file("named.narc", 1, &tiles, &pal);
+file("test.nds", 2, &tiles, &pal);
+file("lz10.bin", 3, &tiles, &pal);
+file("lz11.bin", 3, &tiles, &pal);
+file("blz.bin", 3, &tiles, &pal);
+file("test.nclr", 4, &tiles, &pal);
+file("tiles4.ncgr", 4, &tiles, &pal);
+file("linear.ncgr", 4, &tiles, &pal);
+file("screen.nscr", 4, &tiles, &pal);
+file("cells.ncer", 4, &tiles, &pal);
+file("test.nsbtx", 5, &tiles, &pal);
+file("test.nsbmd", 5, &tiles, &pal);
+// random garbage behind each magic
+string[10] magics = {"SDAT", "NARC", "RLCN", "RGCN", "RCSN", "RECN", "BTX0", "BMD0", "SWAR", "SSEQ"};
+for (it in 0..iterations) {
+    int n = (int)(rnd() % 600) + 4;
+    *uint8 g = alloc<uint8>((int64)n);
+    for (i in 0..n) g[i] = (uint8)rnd();
+    string m = magics[(int)(rnd() % 10)];
+    for (i in 0..4) g[i] = (uint8)m[i];
+    for (kind in 0..6) try_all(kind, g, (int64)n, &tiles, &pal);
+    free((*void)g);
+}
+
+pal.free();
+tiles.free();
+free((*void)pd.data);
+free((*void)td.data);
+printf("corrupt: ok\n");

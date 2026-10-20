@@ -1,0 +1,210 @@
+// NARC archives (with and without names), a ROM's header, file system and
+// overlays, and the LZ10, LZ11 and BLZ decompressors, against the files and
+// expectations of tools/gen_test_data.py (tests/data/narc.txt, rom.txt).
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <nds/bin>;
+import <nds/narc>;
+import <nds/rom>;
+import <nds/lz>;
+
+extern int atoi(string s);
+
+int fails = 0;
+
+void check(bool ok, string what) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+string path_of(string name) {
+    let p: Bytes;
+    p.init(64);
+    p.append_raw((*uint8)"tests/data/", 11);
+    p.append_raw((*uint8)name, strlen(name));
+    p.push(0);
+    return (string)p.data;
+}
+
+NdsData slurp(string name) {
+    string p = path_of(name);
+    int64 n = 0;
+    *uint8 d = fs_read_all(p, &n);
+    free((*void)p);
+    return NdsData{data: d, len: n};
+}
+
+bool same(NdsData a, *uint8 b, int64 n) {
+    if (a.len != n) return false;
+    return n == 0 || memcmp((*void)a.data, (*void)b, n) == 0;
+}
+
+// The lines of a text file, split at spaces: words[line][k].
+struct Lines {
+    NdsData text;
+    int count;
+    *int start;
+    *int nwords;
+    **string words;
+}
+
+Lines read_lines(string name) {
+    let l: Lines;
+    l.text = slurp(name);
+    l.start = alloc<int>(256);
+    l.nwords = alloc<int>(256);
+    l.words = alloc<*string>(256);
+    *uint8 t = l.text.data;
+    int64 i = 0;
+    while (i < l.text.len && l.count < 256) {
+        *string w = alloc<string>(16);
+        int n = 0;
+        while (i < l.text.len && t[i] != 10) {
+            while (i < l.text.len && t[i] == 32) {
+                t[i] = 0;
+                i++;
+            }
+            if (i >= l.text.len || t[i] == 10) break;
+            if (n < 16) w[n] = (string)(t + i);
+            n++;
+            while (i < l.text.len && t[i] != 32 && t[i] != 10) i++;
+        }
+        if (i < l.text.len) t[i] = 0;
+        i++;
+        l.words[l.count] = w;
+        l.nwords[l.count] = n;
+        l.count++;
+    }
+    return l;
+}
+
+void narcs() {
+    Lines l = read_lines("narc.txt");
+    Result<Narc, string> pr = Narc_open("tests/data/plain.narc");
+    Result<Narc, string> nr = Narc_open("tests/data/named.narc");
+    if (!pr.ok || !nr.ok) {
+        check(false, "the NARCs open");
+        return;
+    }
+    Narc plain = pr.value;
+    Narc named = nr.value;
+    check(plain.count() == 5 && named.count() == 4, "NARC file counts");
+    check(plain.name(0) == null && plain.find("x") == -1, "an unnamed NARC");
+    for (k in 0..l.count) {
+        *string w = l.words[k];
+        if (l.nwords[k] < 3) continue;
+        int i = atoi(w[1]);
+        if (strcmp(w[0], "plain") == 0) {
+            NdsData want = slurp(w[2]);
+            check(same(plain.file(i), want.data, want.len), "a file of the plain NARC");
+            if (want.data != null) free((*void)want.data);
+        } else {
+            check(named.name(i) != null && strcmp(named.name(i), w[2]) == 0, "a name of the named NARC");
+            check(named.find(w[2]) == i, "find by path");
+            // the content is "file " and the path; the list spells it with _
+            NdsData f = named.file_path(w[2]);
+            bool ok = f.len == (int64)strlen(w[3]);
+            for (int64 c = 0; ok && c < f.len; c++) {
+                uint8 e = (uint8)w[3][c];
+                if (e == '_') e = ' ';
+                if (f.data[c] != e) ok = false;
+            }
+            check(ok, "a file of the named NARC by path");
+        }
+    }
+    check(named.file(4).data == null && named.file(-1).data == null && named.file_path("nope").data == null, "missing files");
+    plain.close();
+    named.close();
+    uint8[12] junk = {0x4E, 0x41, 0x52, 0x43, 0, 0, 0, 0, 0, 0, 0, 0};
+    check(!Narc_from(&junk[0], 12).ok, "a NARC header alone");
+}
+
+void rom() {
+    Lines l = read_lines("rom.txt");
+    Result<NdsRom, string> rr = NdsRom_open("tests/data/test.nds");
+    if (!rr.ok) {
+        printf("  %s\n", rr.error);
+        check(false, "the ROM opens");
+        return;
+    }
+    NdsRom r = rr.value;
+    check(strcmp(r.title, "TESTROM") == 0 && strcmp(r.code, "ETST") == 0 && strcmp(r.maker, "01") == 0, "ROM header strings");
+    check(r.version == 3 && r.arm9_size == 64 && r.arm9_ram == 0x02000000 && r.arm9_entry == 0x02000800, "ROM header fields");
+    check(r.arm9().len == 64, "the ARM9 binary");
+    check(r.noverlays == 2 && r.overlays[0].compressed && !r.overlays[1].compressed && r.overlays[1].ram == 0x02101000, "overlay table");
+    for (k in 0..l.count) {
+        *string w = l.words[k];
+        if (strcmp(w[0], "files") == 0) check(r.count() == atoi(w[1]), "ROM file count");
+        if (strcmp(w[0], "file") == 0) {
+            int id = atoi(w[1]);
+            check(r.find(w[2]) == id && strcmp(r.name(id), w[2]) == 0, "ROM path and id");
+            check(r.file_path(w[2]).len == (int64)atoi(w[3]), "ROM file size");
+        }
+        if (strcmp(w[0], "overlay") == 0) {
+            int id = atoi(w[1]);
+            Result<Bytes, string> o = r.overlay(id);
+            uint8[16] name;
+            sprintf(&name[0], "overlay%d.bin", id);
+            NdsData want = slurp((string)&name[0]);
+            check(o.ok && same(NdsData{data: o.value.data, len: o.value.len}, want.data, want.len), "an overlay");
+            if (o.ok) o.value.free();
+            if (want.data != null) free((*void)want.data);
+        }
+    }
+    check(!r.overlay(5).ok, "a missing overlay");
+    NdsData hello = r.file_path("data/hello.txt");
+    check(same(hello, (*uint8)"hello from the rom", 18), "a ROM file's bytes");
+    check(r.name(0) == null && r.name(1) == null, "overlay files have no names");
+    Result<Narc, string> inner = r.narc("data/inner.narc");
+    check(inner.ok && inner.value.count() == 2 && same(inner.value.file(1), (*uint8)"second!", 7), "a NARC inside the ROM");
+    if (inner.ok) inner.value.close();
+    check(!r.narc("readme").ok && !r.narc("nope").ok, "files that are not NARCs");
+    r.close();
+}
+
+void lz() {
+    NdsData plain = slurp("lz_plain.bin");
+    for (k in 0..2) {
+        NdsData c = slurp(k == 0 ? "lz10.bin" : "lz11.bin");
+        check(nds_is_lz(c.data, c.len), "LZ data is recognized");
+        Result<Bytes, string> d = nds_lz_decompress(c.data, c.len);
+        check(d.ok && same(NdsData{data: d.value.data, len: d.value.len}, plain.data, plain.len), k == 0 ? "LZ10" : "LZ11");
+        if (d.ok) d.value.free();
+        Result<Bytes, string> u = nds_unpack(c.data, c.len);
+        check(u.ok && u.value.len == plain.len, "unpack of LZ data");
+        if (u.ok) u.value.free();
+        // every truncation is an error
+        bool all = true;
+        for (int64 n = 0; n < c.len; n += 7) {
+            Result<Bytes, string> t = nds_lz_decompress(c.data, n);
+            if (t.ok) {
+                all = false;
+                t.value.free();
+            }
+        }
+        check(all, "truncated LZ data is an error");
+        free((*void)c.data);
+    }
+    Result<Bytes, string> u = nds_unpack(plain.data, 100);
+    check(u.ok && same(NdsData{data: u.value.data, len: u.value.len}, plain.data, 100), "unpack copies other data");
+    if (u.ok) u.value.free();
+    free((*void)plain.data);
+    NdsData bp = slurp("blz_plain.bin");
+    NdsData bc = slurp("blz.bin");
+    Result<Bytes, string> b = nds_blz_decompress(bc.data, bc.len);
+    check(b.ok && same(NdsData{data: b.value.data, len: b.value.len}, bp.data, bp.len), "BLZ");
+    if (b.ok) b.value.free();
+    free((*void)bp.data);
+    free((*void)bc.data);
+}
+
+narcs();
+rom();
+lz();
+if (fails > 0) return 1;
+printf("archive: ok\n");
