@@ -1,0 +1,19 @@
+// nds.esk: every module of the package.
+//
+//     import <nds>;
+//
+// <nds/bin> bounds-checked reads, <nds/lz> LZ10, LZ11 and BLZ, <nds/narc>
+// NARC archives, <nds/rom> ROM headers, file systems and overlays,
+// <nds/sdat> sound archives and their synthesizer, <nds/wav> WAV files,
+// <nds/image> RGBA images and PNG, <nds/graphics> 2D graphics, <nds/model>
+// 3D textures and models.
+
+import <nds/bin>;
+import <nds/lz>;
+import <nds/narc>;
+import <nds/rom>;
+import <nds/sdat>;
+import <nds/wav>;
+import <nds/image>;
+import <nds/graphics>;
+import <nds/model>;
