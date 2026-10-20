@@ -1,0 +1,96 @@
+// Writes the textures of NSBTX and NSBMD files as PNG images.
+//
+//     eskiuc run examples/nds_textures.esk models.nsbtx out/
+//     eskiuc run examples/nds_textures.esk archive.narc out/        # every file in it
+//     eskiuc run examples/nds_textures.esk game.nds out/ a/0/4/4    # a NARC in a ROM
+//
+// Each texture is out/NAME.png (out/INDEX_NAME.png for files of a NARC),
+// drawn with the palette its model's materials give it, else the palette of
+// the same name, "<name>_pl", or the first. The directory must exist.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <nds/bin>;
+import <nds/lz>;
+import <nds/narc>;
+import <nds/rom>;
+import <nds/image>;
+import <nds/model>;
+
+int written = 0;
+
+Result<int, string> dump(NdsData d, string dir, int index) {
+    Bytes b = nds_unpack(d.data, d.len)?;
+    defer b.free();
+    if (b.len < 4 || (!NdsData{data: b.data, len: b.len}.magic(0, "BTX0") && !NdsData{data: b.data, len: b.len}.magic(0, "BMD0"))) return Ok<int, string>(0);
+    NdsTexSet ts = nds_texset(b.data, b.len)?;
+    defer ts.free();
+    Result<NdsModel, string> m = nsbmd_read(b.data, b.len);
+    for (i in 0..ts.ntex) {
+        int pal = m.ok ? m.value.palette_for(&ts, i) : ts.palette_for(i);
+        NdsImage img = ts.image(i, pal)?;
+        let path: Bytes;
+        path.init(256);
+        path.append_raw((*uint8)dir, strlen(dir));
+        path.push((uint8)'/');
+        if (index >= 0) {
+            uint8[16] num;
+            sprintf(&num[0], "%d_", index);
+            path.append_raw(&num[0], strlen((string)&num[0]));
+        }
+        path.append_raw((*uint8)ts.tex[i].name, strlen(ts.tex[i].name));
+        path.append_raw((*uint8)".png", 4);
+        path.push(0);
+        Result<int, string> w = img.write_png((string)path.data);
+        path.free();
+        img.free();
+        if (!w.ok) {
+            if (m.ok) m.value.free();
+            return w;
+        }
+        written++;
+    }
+    if (m.ok) m.value.free();
+    return Ok<int, string>(0);
+}
+
+Result<int, string> dump_narc(Narc* n, string dir) {
+    for (i in 0..n.count()) {
+        Result<int, string> r = dump(n.file(i), dir, i);
+        if (!r.ok) printf("file %d: %s\n", i, r.error);
+    }
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run(string path, string dir, string inner) {
+    NdsData d = nds_read_file(path)?;
+    defer free((*void)d.data);
+    if (d.magic(0, "NARC")) {
+        Narc n = Narc_from(d.data, d.len)?;
+        defer n.close();
+        return dump_narc(&n, dir);
+    }
+    if (inner != null) {
+        NdsRom rom = NdsRom_from(d.data, d.len)?;
+        defer rom.close();
+        Narc n = rom.narc(inner)?;
+        defer n.close();
+        return dump_narc(&n, dir);
+    }
+    return dump(d, dir, -1);
+}
+
+if (argc < 3) {
+    printf("usage: nds_textures FILE OUTDIR [NARC_PATH_IN_ROM]\n");
+    return 1;
+}
+
+Result<int, string> r = run(argv[1], argv[2], argc > 3 ? argv[3] : null);
+if (!r.ok) {
+    printf("error: %s\n", r.error);
+    return 1;
+}
+
+printf("%d textures\n", written);
