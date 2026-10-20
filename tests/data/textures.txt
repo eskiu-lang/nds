@@ -1,0 +1,7 @@
+tex a3i5 1 8 8 tex_a3i5.rgba
+tex four 2 16 8 tex_four.rgba
+tex sixteen 3 8 16 tex_sixteen.rgba
+tex compressed 5 8 8 tex_compressed.rgba
+tex a5i3 6 8 8 tex_a5i3.rgba
+tex direct 7 8 8 tex_direct.rgba
+tex indexed 4 8 8 tex_indexed.rgba

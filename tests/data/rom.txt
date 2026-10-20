@@ -1,0 +1,8 @@
+title TESTROM
+code ETST
+files 5
+file 2 readme 1
+file 3 data/hello.txt 18
+file 4 data/inner.narc 83
+overlay 0 520
+overlay 1 28

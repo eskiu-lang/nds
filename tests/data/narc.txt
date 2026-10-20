@@ -1,0 +1,9 @@
+plain 0 narc_file0.bin
+plain 1 narc_file1.bin
+plain 2 narc_file2.bin
+plain 3 narc_file3.bin
+plain 4 narc_file4.bin
+named 0 top.txt file_top.txt
+named 1 a/z.dat file_a/z.dat
+named 2 a/0/x.bin file_a/0/x.bin
+named 3 a/0/y.bin file_a/0/y.bin
