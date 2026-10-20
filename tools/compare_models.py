@@ -137,12 +137,19 @@ def main():
                     p = line.split(" ")
                     if len(p) < 10:
                         continue
-                    got[p[0]].append(tuple(round(float(x), 2) for x in p[1:10]))
+                    got[p[0]].append(tuple(float(x) for x in p[1:10]))
                 bad = r.returncode != 0
                 for tex, tris in geo.items():
-                    want = sorted(tuple(round(c, 2) for v in t for c in v) for t in tris)
-                    have = sorted(got.get(tex, []))
-                    if len(want) != len(have) or any(max(abs(x - y) for x, y in zip(p, q)) > 0.011 for p, q in zip(want, have)):
+                    want = [tuple(c for v in t for c in v) for t in tris]
+                    have = got.get(tex, [])
+                    if len(want) != len(have):
+                        bad = True
+                        continue
+
+                    def close(xs, ys):
+                        return all(max(abs(x - y) for x, y in zip(p, q)) <= 1e-3 for p, q in zip(xs, ys))
+                    # in drawing order, else (a texture shared by materials) sorted
+                    if not close(want, have) and not close(sorted(want), sorted(have)):
                         bad = True
                 if len(got) != len(geo):
                     bad = True
