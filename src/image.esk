@@ -1,0 +1,159 @@
+// image.esk: RGBA images and a PNG writer.
+//
+//     NdsImage img = NdsImage_new(64, 32);     // transparent black
+//     img.set(3, 4, 255, 0, 0, 255);
+//     img.write_png("out.png")?;
+//     defer img.free();
+//
+// The PNG writer stores its pixels in uncompressed DEFLATE blocks: the files
+// are larger than a compressing encoder's but any PNG reader opens them, and
+// the package needs nothing beyond the standard library.
+
+import <mem>;
+import <fs>;
+import <bytes>;
+import <result>;
+
+// width * height pixels, 4 bytes each (R, G, B, A), rows top to bottom.
+struct NdsImage {
+    int width;
+    int height;
+    *uint8 rgba;
+}
+
+NdsImage NdsImage_new(int width, int height) {
+    int w = width < 0 ? 0 : width;
+    int h = height < 0 ? 0 : height;
+    return NdsImage{width: w, height: h, rgba: alloc<uint8>((int64)w * (int64)h * 4 + 4)};
+}
+
+void NdsImage_free(NdsImage* self) {
+    if (self.rgba != null) free((*void)self.rgba);
+    self.rgba = null;
+    self.width = 0;
+    self.height = 0;
+}
+
+// Sets pixel (x, y); a pixel outside the image is ignored.
+void NdsImage_set(NdsImage* self, int x, int y, int r, int g, int b, int a) {
+    if (x < 0 || y < 0 || x >= self.width || y >= self.height) return;
+    *uint8 p = self.rgba + ((int64)y * (int64)self.width + (int64)x) * 4;
+    p[0] = (uint8)r;
+    p[1] = (uint8)g;
+    p[2] = (uint8)b;
+    p[3] = (uint8)a;
+}
+
+// The pixel at (x, y) as 0xAABBGGRR, 0 outside the image.
+uint32 NdsImage_get(NdsImage* self, int x, int y) {
+    if (x < 0 || y < 0 || x >= self.width || y >= self.height) return 0;
+    *uint8 p = self.rgba + ((int64)y * (int64)self.width + (int64)x) * 4;
+    return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+}
+
+void _png_put32(Bytes* b, uint32 v) {
+    b.push((uint8)(v >> 24));
+    b.push((uint8)(v >> 16));
+    b.push((uint8)(v >> 8));
+    b.push((uint8)v);
+}
+
+uint32 _png_crc(*uint32 table, *uint8 p, int64 n) {
+    uint32 c = (uint32)0xFFFFFFFF;
+    for (int64 i = 0; i < n; i++) c = table[(int)((c ^ (uint32)p[i]) & (uint32)0xFF)] ^ (c >> 8);
+    return c ^ (uint32)0xFFFFFFFF;
+}
+
+// Appends a chunk: length, type and data, then the CRC of type and data.
+void _png_chunk(Bytes* out, *uint32 table, string kind, *uint8 data, int64 n) {
+    _png_put32(out, (uint32)n);
+    int64 start = out.len;
+    out.append_raw((*uint8)kind, 4);
+    if (n > 0) out.append_raw(data, n);
+    _png_put32(out, _png_crc(table, out.data + start, n + 4));
+}
+
+// The image as a PNG file in memory.
+Bytes NdsImage_png_bytes(NdsImage* self) {
+    uint32[256] table;
+    for (k in 0..256) {
+        uint32 c = (uint32)k;
+        for (j in 0..8) c = (c & (uint32)1) != 0 ? (uint32)0xEDB88320 ^ (c >> 1) : c >> 1;
+        table[k] = c;
+    }
+    int64 w = (int64)self.width;
+    int64 h = (int64)self.height;
+    int64 row = w * 4 + 1;
+    int64 raw_len = row * h;
+    // zlib stream: header, stored blocks of up to 65535 bytes, Adler-32
+    let z: Bytes;
+    z.init(raw_len + raw_len / 65535 * 5 + 16);
+    z.push(0x78);
+    z.push(0x01);
+    uint32 s1 = 1;
+    uint32 s2 = 0;
+    int64 done = 0;
+    int64 y = 0;
+    int64 x = 0;
+    if (raw_len == 0) {
+        z.push(1);
+        z.push(0);
+        z.push(0);
+        z.push(0xFF);
+        z.push(0xFF);
+    }
+    while (done < raw_len) {
+        int64 n = raw_len - done;
+        if (n > 65535) n = 65535;
+        z.push(done + n == raw_len ? (uint8)1 : (uint8)0);
+        z.push((uint8)(n & 0xFF));
+        z.push((uint8)(n >> 8));
+        z.push((uint8)(~n & 0xFF));
+        z.push((uint8)((~n >> 8) & 0xFF));
+        for (int64 k = 0; k < n; k++) {
+            // byte x of row y: 0 is the filter (none), then the pixels
+            uint8 v = x == 0 ? (uint8)0 : self.rgba[y * w * 4 + x - 1];
+            z.push(v);
+            s1 = (s1 + (uint32)v) % (uint32)65521;
+            s2 = (s2 + s1) % (uint32)65521;
+            x++;
+            if (x == row) {
+                x = 0;
+                y++;
+            }
+        }
+        done += n;
+    }
+    _png_put32(&z, (s2 << 16) | s1);
+    let out: Bytes;
+    out.init(z.len + 64);
+    uint8[8] sig = {137, 80, 78, 71, 13, 10, 26, 10};
+    out.append_raw(&sig[0], 8);
+    uint8[13] ihdr;
+    ihdr[0] = (uint8)(w >> 24);
+    ihdr[1] = (uint8)(w >> 16);
+    ihdr[2] = (uint8)(w >> 8);
+    ihdr[3] = (uint8)w;
+    ihdr[4] = (uint8)(h >> 24);
+    ihdr[5] = (uint8)(h >> 16);
+    ihdr[6] = (uint8)(h >> 8);
+    ihdr[7] = (uint8)h;
+    ihdr[8] = 8;
+    ihdr[9] = 6;
+    ihdr[10] = 0;
+    ihdr[11] = 0;
+    ihdr[12] = 0;
+    _png_chunk(&out, &table[0], "IHDR", &ihdr[0], 13);
+    _png_chunk(&out, &table[0], "IDAT", z.data, z.len);
+    _png_chunk(&out, &table[0], "IEND", null, 0);
+    z.free();
+    return out;
+}
+
+Result<int, string> NdsImage_write_png(NdsImage* self, string path) {
+    Bytes b = self.png_bytes();
+    int ok = fs_write_all(path, b.data, b.len);
+    b.free();
+    if (ok == 0) return Err<int, string>("png: cannot write the file");
+    return Ok<int, string>(0);
+}

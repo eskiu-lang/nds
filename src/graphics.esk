@@ -1,0 +1,430 @@
+// graphics.esk: the DS's 2D graphics files (NitroSystem G2D) to RGBA images.
+//
+//     NdsPalette pal = nclr_read(nclr.data, nclr.len)?;     // RLCN
+//     NdsTiles tiles = ncgr_read(ncgr.data, ncgr.len)?;     // RGCN
+//     NdsScreen scr = nscr_read(nscr.data, nscr.len)?;      // RCSN
+//     NdsImage img = nds_render_screen(&scr, &tiles, &pal, true);
+//     img.write_png("bg.png")?;
+//
+// - NCLR palettes: BGR555 colors, all the palettes of the file in a row.
+// - NCGR tiles: 4 or 8 bits per pixel, as 8x8 tiles or as a linear bitmap.
+// - NSCR screens: tile number, flips and palette per 8x8 cell.
+// - NCER cells: groups of OAM objects (sprites) placed around an origin,
+//   drawn with 1D or 2D tile mapping, or over a linear bitmap atlas as the
+//   multi-cell sprites of later games use. Affine objects are drawn
+//   without their rotation (NANR animations carry it, see <nds/mcss>).
+//
+// Colors are converted as the extraction tools do: each 5-bit channel times
+// 255 / 31, rounded down. Color index 0 of a palette is transparent where
+// the hardware treats it so (screens drawn with transparent0, cells).
+
+import <mem>;
+import <list>;
+import <result>;
+import <nds/bin>;
+import <nds/image>;
+
+// Finds a block by its magic in a Nitro file (after the header). Returns its
+// offset, or -1.
+int64 nds_section(NdsData* d, string magic) {
+    int64 off = d.u16(12);
+    while (d.has(off, 8)) {
+        int64 size = d.u32(off + 4);
+        if (d.magic(off, magic)) return off;
+        if (size <= 0) break;
+        off += size;
+    }
+    return -1;
+}
+
+struct NdsPalette {
+    int count;
+    *uint8 rgb;
+}
+
+void NdsPalette_free(NdsPalette* self) {
+    if (self.rgb != null) free((*void)self.rgb);
+    self.rgb = null;
+    self.count = 0;
+}
+
+int _g2d_c5(int v) {
+    return (v & 31) * 255 / 31;
+}
+
+// Color i as 0xBBGGRR, or magenta when the palette is shorter.
+int NdsPalette_color(NdsPalette* self, int i) {
+    if (i < 0 || i >= self.count) return 0xFF00FF;
+    *uint8 p = self.rgb + (int64)i * 3;
+    return (int)p[0] | ((int)p[1] << 8) | ((int)p[2] << 16);
+}
+
+// count BGR555 colors from p.
+NdsPalette nds_palette_bgr555(*uint8 p, int count) {
+    let pal: NdsPalette;
+    pal.count = count < 0 ? 0 : count;
+    pal.rgb = alloc<uint8>((int64)pal.count * 3 + 3);
+    for (i in 0..pal.count) {
+        int c = (int)p[(int64)i * 2] | ((int)p[(int64)i * 2 + 1] << 8);
+        pal.rgb[(int64)i * 3] = (uint8)_g2d_c5(c);
+        pal.rgb[(int64)i * 3 + 1] = (uint8)_g2d_c5(c >> 5);
+        pal.rgb[(int64)i * 3 + 2] = (uint8)_g2d_c5(c >> 10);
+    }
+    return pal;
+}
+
+// An NCLR (RLCN) file's colors.
+Result<NdsPalette, string> nclr_read(*uint8 data, int64 len) {
+    NdsData d = NdsData{data: data, len: len};
+    if (!d.magic(0, "RLCN")) return Err<NdsPalette, string>("nclr: not an NCLR file");
+    int64 off = nds_section(&d, "TTLP");
+    if (off < 0) return Err<NdsPalette, string>("nclr: no TTLP block");
+    int64 size = d.u32(off + 16);
+    int64 start = off + 8 + d.u32(off + 20);
+    if (start > len) return Err<NdsPalette, string>("nclr: palette out of range");
+    if (size > len - start) size = len - start;
+    return Ok<NdsPalette, string>(nds_palette_bgr555(data + start, (int)(size / 2)));
+}
+
+struct NdsTiles {
+    int bpp;
+    int count;
+    *uint8 pix;
+    int tiles_w;
+    int tiles_h;
+    bool linear;
+}
+
+void NdsTiles_free(NdsTiles* self) {
+    if (self.pix != null) free((*void)self.pix);
+    self.pix = null;
+    self.count = 0;
+}
+
+// An NCGR (RGCN) file. pix holds the color indices: 64 per tile in tile
+// order for tiled data; for a linear bitmap, the pixels row by row
+// (tiles_w * 8 wide). tiles_w and tiles_h are -1 when the file gives none.
+Result<NdsTiles, string> ncgr_read(*uint8 data, int64 len) {
+    NdsData d = NdsData{data: data, len: len};
+    if (!d.magic(0, "RGCN")) return Err<NdsTiles, string>("ncgr: not an NCGR file");
+    int64 off = nds_section(&d, "RAHC");
+    if (off < 0) return Err<NdsTiles, string>("ncgr: no RAHC block");
+    let t: NdsTiles;
+    int h = d.u16(off + 8);
+    int w = d.u16(off + 10);
+    int64 depth = d.u32(off + 12);
+    int64 flag = d.u32(off + 20);
+    int64 size = d.u32(off + 24);
+    int64 start = off + 8 + d.u32(off + 28);
+    if (start > len) return Err<NdsTiles, string>("ncgr: tiles out of range");
+    if (size > len - start) size = len - start;
+    t.bpp = depth == 3 ? 4 : 8;
+    t.linear = (flag & 1) != 0;
+    t.tiles_w = w == 0xFFFF ? -1 : w;
+    t.tiles_h = h == 0xFFFF ? -1 : h;
+    int64 step = t.bpp == 4 ? (int64)32 : (int64)64;
+    t.count = (int)(size / step);
+    int64 npix = (int64)t.count * 64;
+    t.pix = alloc<uint8>(npix + 1);
+    *uint8 raw = data + start;
+    if (t.bpp == 4) {
+        for (int64 i = 0; i < npix / 2; i++) {
+            t.pix[i * 2] = raw[i] & 15;
+            t.pix[i * 2 + 1] = raw[i] >> 4;
+        }
+    } else {
+        memcpy((*void)t.pix, (*void)raw, npix);
+    }
+    return Ok<NdsTiles, string>(t);
+}
+
+// Color index of pixel (x, y) of tile i (tiled data), 0 outside.
+int NdsTiles_index(NdsTiles* self, int tile, int x, int y) {
+    if (tile < 0 || tile >= self.count) return 0;
+    return (int)self.pix[(int64)tile * 64 + (int64)y * 8 + (int64)x];
+}
+
+int _g2d_pal_index(int bpp, int palno, int c) {
+    return bpp == 4 ? palno * 16 + c : c;
+}
+
+void _g2d_put(NdsImage* img, int x, int y, NdsPalette* pal, int pi) {
+    int c = pal.color(pi);
+    img.set(x, y, c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF, 255);
+}
+
+// All the tiles in a sheet, cols tiles wide (the file's width when it has
+// one), with palette palno for 4-bit tiles; index 0 is transparent. For a
+// linear NCGR this is the bitmap itself.
+NdsImage NdsTiles_sheet(NdsTiles* self, NdsPalette* pal, int cols, int palno) {
+    if (self.tiles_w > 0) cols = self.tiles_w;
+    if (cols < 1) cols = 1;
+    if (self.linear) {
+        int64 w = (int64)cols * 8;
+        int64 h = ((int64)self.count * 64 + w - 1) / w;
+        NdsImage img = NdsImage_new((int)w, (int)h);
+        for (int64 i = 0; i < (int64)self.count * 64; i++) {
+            int c = (int)self.pix[i];
+            if (c == 0) continue;
+            _g2d_put(&img, (int)(i % w), (int)(i / w), pal, _g2d_pal_index(self.bpp, palno, c));
+        }
+        return img;
+    }
+    int rows = (self.count + cols - 1) / cols;
+    NdsImage img = NdsImage_new(cols * 8, rows * 8);
+    for (i in 0..self.count) {
+        int bx = (i % cols) * 8;
+        int by = (i / cols) * 8;
+        for (y in 0..8) {
+            for (x in 0..8) {
+                int c = self.index(i, x, y);
+                if (c == 0) continue;
+                _g2d_put(&img, bx + x, by + y, pal, _g2d_pal_index(self.bpp, palno, c));
+            }
+        }
+    }
+    return img;
+}
+
+struct NdsScreen {
+    int width;
+    int height;
+    int count;
+    *uint16 entries;
+}
+
+void NdsScreen_free(NdsScreen* self) {
+    if (self.entries != null) free((*void)self.entries);
+    self.entries = null;
+    self.count = 0;
+}
+
+// An NSCR (RCSN) file: width and height in pixels, then one entry per 8x8
+// cell (tile number in bits 0-9, flips in 10 and 11, palette in 12-15).
+Result<NdsScreen, string> nscr_read(*uint8 data, int64 len) {
+    NdsData d = NdsData{data: data, len: len};
+    if (!d.magic(0, "RCSN")) return Err<NdsScreen, string>("nscr: not an NSCR file");
+    int64 off = nds_section(&d, "NRCS");
+    if (off < 0) return Err<NdsScreen, string>("nscr: no NRCS block");
+    let s: NdsScreen;
+    s.width = d.u16(off + 8);
+    s.height = d.u16(off + 10);
+    int64 size = d.u32(off + 16);
+    int64 start = off + 20;
+    if (start > len) return Err<NdsScreen, string>("nscr: screen out of range");
+    if (size > len - start) size = len - start;
+    s.count = (int)(size / 2);
+    s.entries = alloc<uint16>((int64)s.count + 1);
+    for (i in 0..s.count) s.entries[i] = (uint16)d.u16(start + (int64)i * 2);
+    return Ok<NdsScreen, string>(s);
+}
+
+// Draws a screen with its tiles and palette. With transparent0, color index
+// 0 of each tile is left transparent; a tile number past the tiles is skipped
+// and a color past the palette is magenta.
+NdsImage nds_render_screen(NdsScreen* scr, NdsTiles* tiles, NdsPalette* pal, bool transparent0) {
+    NdsImage img = NdsImage_new(scr.width, scr.height);
+    int cols = scr.width / 8;
+    if (cols < 1) return img;
+    for (i in 0..scr.count) {
+        int e = (int)scr.entries[i];
+        int ti = e & 0x3FF;
+        bool hf = ((e >> 10) & 1) != 0;
+        bool vf = ((e >> 11) & 1) != 0;
+        int pn = e >> 12;
+        if (ti >= tiles.count) continue;
+        int bx = (i % cols) * 8;
+        int by = (i / cols) * 8;
+        if (by >= scr.height) break;
+        for (y in 0..8) {
+            for (x in 0..8) {
+                int c = tiles.index(ti, x, y);
+                if (c == 0 && transparent0) continue;
+                _g2d_put(&img, bx + (hf ? 7 - x : x), by + (vf ? 7 - y : y), pal, _g2d_pal_index(tiles.bpp, pn, c));
+            }
+        }
+    }
+    return img;
+}
+
+// ---- cells (NCER) ----
+
+// One OAM object of a cell. x and y are relative to the cell's origin (for
+// a double-size affine object, of its tiles, half the object inside the box
+// the hardware draws).
+struct NdsOam {
+    int x;
+    int y;
+    int w;
+    int h;
+    int tile;
+    int palette;
+    bool hflip;
+    bool vflip;
+    bool affine;
+    bool double_size;
+    int mode;
+    int priority;
+    bool bpp8;
+}
+
+struct NdsCells {
+    int count;
+    *int first;
+    *int n;
+    List<NdsOam> oams;
+    int mapping;
+}
+
+void NdsCells_free(NdsCells* self) {
+    if (self.first != null) free((*void)self.first);
+    if (self.n != null) free((*void)self.n);
+    if (self.oams.data != null) List_free<NdsOam>(&self.oams);
+    self.first = null;
+    self.n = null;
+    self.count = 0;
+}
+
+int[12] _G2D_OAM_W = {8, 16, 32, 64, 16, 32, 32, 64, 8, 8, 16, 32};
+int[12] _G2D_OAM_H = {8, 16, 32, 64, 8, 8, 16, 32, 16, 32, 32, 64};
+
+// An NCER (RECN) file: its cells and their OAM objects. mapping is the
+// file's tile mapping (0 to 3: 1D with 32, 64, 128 or 256 KB boundaries; 4:
+// 2D).
+Result<NdsCells, string> ncer_read(*uint8 data, int64 len) {
+    NdsData d = NdsData{data: data, len: len};
+    if (!d.magic(0, "RECN")) return Err<NdsCells, string>("ncer: not an NCER file");
+    int64 sec = nds_section(&d, "KBEC");
+    if (sec < 0) return Err<NdsCells, string>("ncer: no KBEC block");
+    int64 s = sec + 8;
+    let c: NdsCells;
+    int n = d.u16(s);
+    int bank = d.u16(s + 2);
+    int64 off = d.u32(s + 4);
+    c.mapping = (int)d.u32(s + 8);
+    int64 ent = bank == 1 ? (int64)16 : (int64)8;
+    int64 base = s + off;
+    int64 oam = base + (int64)n * ent;
+    if (!d.has(base, (int64)n * ent)) return Err<NdsCells, string>("ncer: cells out of range");
+    c.count = n;
+    c.first = alloc<int>((int64)n + 1);
+    c.n = alloc<int>((int64)n + 1);
+    c.oams.init(16);
+    for (i in 0..n) {
+        int cnt = d.u16(base + (int64)i * ent);
+        int64 oo = d.u32(base + (int64)i * ent + 4);
+        c.first[i] = c.oams.size;
+        if (!d.has(oam + oo, (int64)cnt * 6)) {
+            NdsCells_free(&c);
+            return Err<NdsCells, string>("ncer: objects out of range");
+        }
+        for (k in 0..cnt) {
+            int64 p = oam + oo + (int64)k * 6;
+            int a0 = d.u16(p);
+            int a1 = d.u16(p + 2);
+            int a2 = d.u16(p + 4);
+            let o: NdsOam;
+            o.y = a0 & 0xFF;
+            if (o.y >= 128) o.y -= 256;
+            o.x = a1 & 0x1FF;
+            if (o.x >= 256) o.x -= 512;
+            int shape = (a0 >> 14) & 3;
+            int size = (a1 >> 14) & 3;
+            if (shape == 3) shape = 0;
+            o.w = _G2D_OAM_W[shape * 4 + size];
+            o.h = _G2D_OAM_H[shape * 4 + size];
+            o.tile = a2 & 0x3FF;
+            o.palette = (a2 >> 12) & 15;
+            o.priority = (a2 >> 10) & 3;
+            o.affine = (a0 & 0x100) != 0;
+            o.double_size = o.affine && (a0 & 0x200) != 0;
+            o.mode = (a0 >> 10) & 3;
+            o.bpp8 = (a0 & 0x2000) != 0;
+            o.hflip = !o.affine && (a1 & 0x1000) != 0;
+            o.vflip = !o.affine && (a1 & 0x2000) != 0;
+            if (o.double_size) {
+                o.x += o.w / 2;
+                o.y += o.h / 2;
+            }
+            c.oams.push(o);
+        }
+        c.n[i] = cnt;
+    }
+    return Ok<NdsCells, string>(c);
+}
+
+NdsOam* NdsCells_oam(NdsCells* self, int cell, int k) {
+    return &self.oams.data[self.first[cell] + k];
+}
+
+// The color index of pixel (x, y) of object o, from tiled or linear tiles.
+int _g2d_oam_index(NdsCells* c, NdsOam* o, NdsTiles* t, int x, int y) {
+    if (t.linear) {
+        // an atlas bitmap: the tile number is a position in it, row by row
+        int cols = t.tiles_w > 0 ? t.tiles_w : 32;
+        int64 px = (int64)(o.tile % cols) * 8 + (int64)x;
+        int64 py = (int64)(o.tile / cols) * 8 + (int64)y;
+        int64 w = (int64)cols * 8;
+        if (px >= w) return 0;
+        int64 i = py * w + px;
+        if (i >= (int64)t.count * 64) return 0;
+        return (int)t.pix[i];
+    }
+    int tx = x / 8;
+    int ty = y / 8;
+    int tile = 0;
+    int unit = o.bpp8 || t.bpp == 8 ? 2 : 1;
+    if (c.mapping == 4) {
+        tile = (o.tile + ty * 32 + tx * unit) / unit;
+    } else {
+        tile = ((o.tile << (c.mapping & 3)) + (ty * (o.w / 8) + tx) * unit) / unit;
+    }
+    return t.index(tile, x % 8, y % 8);
+}
+
+// Draws cell i onto dst with the cell's origin at (ox, oy): its objects from
+// the last to the first, so the first is on top. Index 0 is transparent.
+void NdsCells_draw(NdsCells* self, int cell, NdsTiles* tiles, NdsPalette* pal, NdsImage* dst, int ox, int oy) {
+    if (cell < 0 || cell >= self.count) return;
+    for (int k = self.n[cell] - 1; k >= 0; k--) {
+        NdsOam* o = self.oam(cell, k);
+        for (y in 0..o.h) {
+            for (x in 0..o.w) {
+                int c = _g2d_oam_index(self, o, tiles, x, y);
+                if (c == 0) continue;
+                int dx = o.hflip ? o.w - 1 - x : x;
+                int dy = o.vflip ? o.h - 1 - y : y;
+                int pi = tiles.bpp == 4 && !o.bpp8 ? o.palette * 16 + c : c;
+                _g2d_put(dst, ox + o.x + dx, oy + o.y + dy, pal, pi);
+            }
+        }
+    }
+}
+
+// The bounding box of cell i's objects around its origin.
+void NdsCells_bounds(NdsCells* self, int cell, *int x0, *int y0, *int x1, *int y1) {
+    *x0 = 0;
+    *y0 = 0;
+    *x1 = 0;
+    *y1 = 0;
+    if (cell < 0 || cell >= self.count) return;
+    for (k in 0..self.n[cell]) {
+        NdsOam* o = self.oam(cell, k);
+        if (k == 0 || o.x < *x0) *x0 = o.x;
+        if (k == 0 || o.y < *y0) *y0 = o.y;
+        if (k == 0 || o.x + o.w > *x1) *x1 = o.x + o.w;
+        if (k == 0 || o.y + o.h > *y1) *y1 = o.y + o.h;
+    }
+}
+
+// Cell i alone, cropped to its objects.
+NdsImage NdsCells_render(NdsCells* self, int cell, NdsTiles* tiles, NdsPalette* pal) {
+    int x0 = 0;
+    int y0 = 0;
+    int x1 = 0;
+    int y1 = 0;
+    self.bounds(cell, &x0, &y0, &x1, &y1);
+    NdsImage img = NdsImage_new(x1 - x0, y1 - y0);
+    self.draw(cell, tiles, pal, &img, -x0, -y0);
+    return img;
+}
