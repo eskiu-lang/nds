@@ -1,0 +1,109 @@
+// Dumps NitroSystem 3D files for tools/compare_models.py:
+//
+//     nitro_dump textures FILE OUTDIR      each texture as OUTDIR/NAME.raw, with the
+//                                          palette its model's materials give it, else
+//                                          the one NdsTexSet_palette_for gives
+//     nitro_dump textures FILE OUTDIR btx  the palette tools/nds/btx.py picks with
+//                                          pair_by_name: "<name>_pl", else the first
+//     nitro_dump model FILE                prints each triangle: material texture x y z ...
+//
+// A .raw file is the width and height as two little-endian uint32, then RGBA.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <nds/bin>;
+import <nds/lz>;
+import <nds/image>;
+import <nds/model>;
+
+extern int atoi(string s);
+
+Result<int, string> textures(NdsData* d, string dir, bool btx) {
+    NdsTexSet ts = nds_texset(d.data, d.len)?;
+    defer ts.free();
+    // a model's materials name the palette of each texture
+    let m: NdsModel;
+    bool has_model = false;
+    if (d.magic(0, "BMD0")) {
+        Result<NdsModel, string> mr = nsbmd_read(d.data, d.len);
+        if (mr.ok) {
+            m = mr.value;
+            has_model = true;
+        }
+    }
+    defer {
+        if (has_model) m.free();
+    }
+    for (i in 0..ts.ntex) {
+        int p = has_model ? m.palette_for(&ts, i) : ts.palette_for(i);
+        if (btx) {
+            p = _tex_find_pl(&ts, ts.tex[i].name);
+            if (p < 0) p = ts.npal > 0 ? 0 : -1;
+        }
+        NdsImage img = ts.image(i, p)?;
+        let path: Bytes;
+        path.init(256);
+        path.append_raw((*uint8)dir, strlen(dir));
+        path.push((uint8)'/');
+        path.append_raw((*uint8)ts.tex[i].name, strlen(ts.tex[i].name));
+        path.append_raw((*uint8)".raw", 4);
+        path.push(0);
+        let b: Bytes;
+        b.init((int64)img.width * (int64)img.height * 4 + 8);
+        uint8[8] hdr;
+        for (k in 0..4) {
+            hdr[k] = (uint8)(img.width >> (k * 8));
+            hdr[k + 4] = (uint8)(img.height >> (k * 8));
+        }
+        b.append_raw(&hdr[0], 8);
+        b.append_raw(img.rgba, (int64)img.width * (int64)img.height * 4);
+        fs_write_all((string)path.data, b.data, b.len);
+        printf("%s %d %d %d\n", ts.tex[i].name, ts.tex[i].format, img.width, img.height);
+        b.free();
+        path.free();
+        img.free();
+    }
+    return Ok<int, string>(0);
+}
+
+Result<int, string> model(NdsData* d) {
+    NdsModel m = nsbmd_read(d.data, d.len)?;
+    defer m.free();
+    for (i in 0..m.groups.size) {
+        NdsMeshGroup* g = &m.groups.data[i];
+        string tex = g.material >= 0 && m.materials[g.material].texture != null ? m.materials[g.material].texture : "";
+        for (k in 0..g.verts.size / 3) {
+            printf("%s", tex);
+            for (j in 0..3) {
+                NdsVertex* v = &g.verts.data[k * 3 + j];
+                printf(" %.4f %.4f %.4f", (double)v.x, (double)v.y, (double)v.z);
+            }
+            printf("\n");
+        }
+    }
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run(int n, *string a) {
+    NdsData raw = nds_read_file(a[2])?;
+    defer free((*void)raw.data);
+    Bytes b = nds_unpack(raw.data, raw.len)?;
+    defer b.free();
+    NdsData d = NdsData{data: b.data, len: b.len};
+    if (strcmp(a[1], "textures") == 0 && n > 3) return textures(&d, a[3], n > 4 && strcmp(a[4], "btx") == 0);
+    if (strcmp(a[1], "model") == 0) return model(&d);
+    return Err<int, string>("unknown command");
+}
+
+if (argc < 3) {
+    printf("usage: nitro_dump textures FILE OUTDIR [PAL] | model FILE\n");
+    return 1;
+}
+
+Result<int, string> r = run(argc, argv);
+if (!r.ok) {
+    printf("error: %s\n", r.error);
+    return 1;
+}
