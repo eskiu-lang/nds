@@ -107,7 +107,8 @@ Result<Bytes, string> nds_unpack(*uint8 d, int64 len) {
 
 // The backward LZ of overlays and the ARM9 binary: a footer at the end gives
 // the compressed span and how much the data grows; it decodes from the end
-// toward the start, in place.
+// toward the start. Compressed bytes are read from the input, so a stream
+// that would overwrite itself in place still decodes.
 Result<Bytes, string> nds_blz_decompress(*uint8 d, int64 len) {
     let o: Bytes;
     if (len < 8) {
@@ -129,7 +130,7 @@ Result<Bytes, string> nds_blz_decompress(*uint8 d, int64 len) {
     int64 stop = len - enc;
     while (src > stop) {
         src--;
-        int flags = (int)o.data[src];
+        int flags = (int)d[src];
         for (b in 0..8) {
             if (src <= stop) break;
             if ((flags & 0x80) != 0) {
@@ -138,7 +139,7 @@ Result<Bytes, string> nds_blz_decompress(*uint8 d, int64 len) {
                     return Err<Bytes, string>("blz: truncated");
                 }
                 src -= 2;
-                int64 v = (int64)o.data[src] | ((int64)o.data[src + 1] << 8);
+                int64 v = (int64)d[src] | ((int64)d[src + 1] << 8);
                 int64 disp = (v & 0xFFF) + 3;
                 int64 n = (v >> 12) + 3;
                 for (int64 k = 0; k < n; k++) {
@@ -156,7 +157,7 @@ Result<Bytes, string> nds_blz_decompress(*uint8 d, int64 len) {
                     o.free();
                     return Err<Bytes, string>("blz: bad data");
                 }
-                o.data[dst] = o.data[src];
+                o.data[dst] = d[src];
             }
             flags = flags << 1;
         }

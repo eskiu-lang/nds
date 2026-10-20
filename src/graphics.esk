@@ -159,6 +159,7 @@ void _g2d_put(NdsImage* img, int x, int y, NdsPalette* pal, int pi) {
 NdsImage NdsTiles_sheet(NdsTiles* self, NdsPalette* pal, int cols, int palno) {
     if (self.tiles_w > 0) cols = self.tiles_w;
     if (cols < 1) cols = 1;
+    if (cols > 512) cols = 512;
     if (self.linear) {
         int64 w = (int64)cols * 8;
         int64 h = ((int64)self.count * 64 + w - 1) / w;
@@ -209,6 +210,7 @@ Result<NdsScreen, string> nscr_read(*uint8 data, int64 len) {
     let s: NdsScreen;
     s.width = d.u16(off + 8);
     s.height = d.u16(off + 10);
+    if (s.width > 4096 || s.height > 4096) return Err<NdsScreen, string>("nscr: screen larger than 4096 pixels");
     int64 size = d.u32(off + 16);
     int64 start = off + 20;
     if (start > len) return Err<NdsScreen, string>("nscr: screen out of range");

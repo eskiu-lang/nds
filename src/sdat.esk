@@ -25,7 +25,9 @@
 // Output is 48 kHz stereo. The arithmetic, the libm calls and the order of
 // the floating point operations are the Rust engine's, so the 16-bit output
 // is the same sample for sample. Up to 32 voices sound at once (the oldest is
-// stolen, released ones first); a sequence may open at most 256 tracks.
+// stolen, released ones first). Two limits keep corrupt data from taking
+// forever, and do not touch real sequences: a sequence may open at most 256
+// tracks, and a tempo set from a variable is capped at 65535.
 
 import <mem>;
 import <fs>;
@@ -1027,7 +1029,7 @@ void _sd_step(SdatPlayer* p, int t) {
         int v = _sd_last_arg(p, tr, mode, 3);
         if (!run) return;
         if (op == 0xE0) tr.mod_delay = v;
-        if (op == 0xE1) p.tempo = v < 1 ? 1 : v;
+        if (op == 0xE1) p.tempo = v < 1 ? 1 : (v > 65535 ? 65535 : v);
     } else if (op == 0xFC) {
         if (!run) return;
         if (tr.nstack > 0 && !tr.st_call[tr.nstack - 1]) {
@@ -1242,6 +1244,9 @@ int64 SdatPlayer_render_f32(SdatPlayer* self, *float out, int64 n) {
             } else {
                 int64 before = (int64)v.pos;
                 int64 after = (int64)(v.pos + v.step);
+                // the LFSR repeats every 32767 steps: a huge step (a corrupt
+                // pitch) runs only what changes the result
+                if (after - before > 65534) before = after - 32767 - (after - before) % 32767;
                 for (int64 c = before; c < after; c++) {
                     if ((v.lfsr & 1) != 0) {
                         v.lfsr = (v.lfsr >> 1) ^ 0x6000;

@@ -58,10 +58,12 @@ string _nds_join(string prefix, *uint8 name, int n, bool slash) {
     return (string)s;
 }
 
-string _nds_walk(NdsData* d, int64 fnt, int ndirs, int dir, string prefix, NdsNames* out, int depth) {
+string _nds_walk(NdsData* d, int64 fnt, int ndirs, int dir, string prefix, NdsNames* out, int depth, *bool seen) {
     if (depth > 64) return "fnt: directories nested too deep";
     int idx = dir & 0xFFF;
     if (idx >= ndirs) return "fnt: bad directory id";
+    if (seen[idx]) return "fnt: a directory listed twice";
+    seen[idx] = true;
     int64 ent = fnt + (int64)idx * 8;
     if (!d.has(ent, 8)) return "fnt: truncated";
     int64 p = fnt + d.u32(ent);
@@ -80,7 +82,7 @@ string _nds_walk(NdsData* d, int64 fnt, int ndirs, int dir, string prefix, NdsNa
             int sub = d.u16(p);
             p += 2;
             string sp = _nds_join(prefix, name, ln, true);
-            string e = _nds_walk(d, fnt, ndirs, sub, sp, out, depth + 1);
+            string e = _nds_walk(d, fnt, ndirs, sub, sp, out, depth + 1, seen);
             free((*void)sp);
             if (e != null) return e;
         } else {
@@ -106,7 +108,9 @@ Result<NdsNames, string> nds_names(NdsData d, int64 fnt, int nfiles) {
         NdsNames_free(&n);
         return Err<NdsNames, string>("fnt: bad directory count");
     }
-    string e = _nds_walk(&d, fnt, ndirs, 0xF000, null, &n, 0);
+    *bool seen = alloc<bool>((int64)ndirs);
+    string e = _nds_walk(&d, fnt, ndirs, 0xF000, null, &n, 0, seen);
+    free((*void)seen);
     if (e != null) {
         NdsNames_free(&n);
         return Err<NdsNames, string>(e);
