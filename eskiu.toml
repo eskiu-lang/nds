@@ -1,0 +1,6 @@
+[package]
+name = "nds"
+version = "0.1.0"
+main = "examples/sdat_play.esk"
+
+[deps]
