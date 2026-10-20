@@ -1,0 +1,749 @@
+// model.esk: NitroSystem 3D files. Texture sets (NSBTX, or the TEX0 block of
+// an NSBMD) to RGBA images, and the geometry of NSBMD models.
+//
+//     NdsTexSet ts = nds_texset(data, len)?;            // BTX0 or BMD0
+//     defer ts.free();
+//     for (i in 0..ts.ntex) {
+//         NdsImage img = ts.image(i, ts.palette_for(i))?;
+//         img.write_png(...)?;
+//         img.free();
+//     }
+//     NdsModel m = nsbmd_read(data, len)?;              // the first model
+//     defer m.free();
+//
+// Textures: all seven DS formats are decoded. 1 A3I5 (32 colors, 3-bit
+// alpha), 2 4-color, 3 16-color, 4 256-color, 5 4x4 compressed (with its
+// four block modes), 6 A5I3 (8 colors, 5-bit alpha) and 7 direct color.
+// Colors are 5-bit channels times 255 / 31 rounded down; the 4x4 blends are
+// made on the 5-bit values, as the hardware does.
+//
+// Models: the first model of an NSBMD, its materials (with the texture and
+// palette names each uses) and its triangles grouped by material, read from
+// the render commands and the pieces' GPU command lists: positions in all
+// the vertex formats, texture coordinates, normals and vertex colors. Like
+// the Tallgrass tools this is made for, the node matrices are not applied
+// (single-node models such as map blocks come out right; posed multi-node
+// models do not), and skinning, texture matrices and animations are not
+// read.
+
+import <mem>;
+import <list>;
+import <result>;
+import <nds/bin>;
+import <nds/image>;
+
+// ---- Nitro dictionaries ----
+
+struct _NdsDictEntry {
+    string name;
+    int64 data;
+}
+
+// The entries of the dictionary at off: each one's name and the offset of
+// its data (unit bytes each).
+Result<int, string> _nds_dict(NdsData* d, int64 off, *_NdsDictEntry* out, *int unit) {
+    *out = null;
+    if (!d.has(off, 8)) return Err<int, string>("nitro: dictionary out of range");
+    int n = d.u8(off + 1);
+    int64 entries = off + d.u16(off + 6);
+    if (!d.has(entries, 4)) return Err<int, string>("nitro: dictionary out of range");
+    int u = d.u16(entries);
+    int64 names = entries + d.u16(entries + 2);
+    if (!d.has(entries + 4, (int64)n * (int64)u) || !d.has(names, (int64)n * 16)) return Err<int, string>("nitro: dictionary out of range");
+    *unit = u;
+    *_NdsDictEntry e = alloc<_NdsDictEntry>((int64)n + 1);
+    for (i in 0..n) {
+        e[i].data = entries + 4 + (int64)i * (int64)u;
+        e[i].name = d.str(names + (int64)i * 16, 16);
+    }
+    *out = e;
+    return Ok<int, string>(n);
+}
+
+void _nds_dict_free(*_NdsDictEntry e, int n) {
+    if (e == null) return;
+    for (i in 0..n) free((*void)e[i].name);
+    free((*void)e);
+}
+
+// The offset of the block with this magic in a Nitro container (BTX0, BMD0,
+// ...), or -1.
+int64 nds_block(NdsData* d, string magic) {
+    int n = d.u16(14);
+    for (i in 0..n) {
+        int64 o = d.u32(0x10 + (int64)i * 4);
+        if (d.magic(o, magic)) return o;
+    }
+    return -1;
+}
+
+// ---- textures ----
+
+const int NDS_TEX_A3I5 = 1;
+const int NDS_TEX_4 = 2;
+const int NDS_TEX_16 = 3;
+const int NDS_TEX_256 = 4;
+const int NDS_TEX_4X4 = 5;
+const int NDS_TEX_A5I3 = 6;
+const int NDS_TEX_DIRECT = 7;
+
+struct NdsTexture {
+    string name;
+    int format;
+    int width;
+    int height;
+    int64 offset;
+    bool color0;
+    bool repeat_s;
+    bool repeat_t;
+    bool flip_s;
+    bool flip_t;
+}
+
+struct NdsTexPalette {
+    string name;
+    int64 offset;
+}
+
+struct NdsTexSet {
+    NdsData d;
+    int64 tex_data;
+    int64 cmp_data;
+    int64 cmp_info;
+    int64 pal_data;
+    int64 pal_size;
+    int ntex;
+    *NdsTexture tex;
+    int npal;
+    *NdsTexPalette pal;
+}
+
+void NdsTexSet_free(NdsTexSet* self) {
+    if (self.tex != null) {
+        for (i in 0..self.ntex) free((*void)self.tex[i].name);
+        free((*void)self.tex);
+    }
+    if (self.pal != null) {
+        for (i in 0..self.npal) free((*void)self.pal[i].name);
+        free((*void)self.pal);
+    }
+    self.tex = null;
+    self.pal = null;
+    self.ntex = 0;
+    self.npal = 0;
+}
+
+// The texture set of a BTX0 or BMD0 file (its TEX0 block). It points into
+// data: free it before data. A file without a TEX0 block gives an empty set.
+Result<NdsTexSet, string> nds_texset(*uint8 data, int64 len) {
+    let ts: NdsTexSet;
+    ts.d = NdsData{data: data, len: len};
+    NdsData* d = &ts.d;
+    int64 t = -1;
+    if (d.magic(0, "TEX0")) {
+        t = 0;
+    } else {
+        if (!d.magic(0, "BTX0") && !d.magic(0, "BMD0")) return Err<NdsTexSet, string>("nitro: not a BTX0 or BMD0 file");
+        t = nds_block(d, "TEX0");
+        if (t < 0) return Ok<NdsTexSet, string>(ts);
+    }
+    if (!d.has(t, 0x3C)) return Err<NdsTexSet, string>("tex0: truncated");
+    ts.tex_data = t + d.u32(t + 0x14);
+    ts.cmp_data = t + d.u32(t + 0x24);
+    ts.cmp_info = t + d.u32(t + 0x28);
+    ts.pal_size = d.u32(t + 0x30) << 3;
+    ts.pal_data = t + d.u32(t + 0x38);
+    int unit = 0;
+    *_NdsDictEntry e = null;
+    Result<int, string> nt = _nds_dict(d, t + d.u16(t + 0x0E), &e, &unit);
+    if (!nt.ok) return Err<NdsTexSet, string>(nt.error);
+    if (nt.value > 0 && unit < 4) {
+        _nds_dict_free(e, nt.value);
+        return Err<NdsTexSet, string>("tex0: bad texture dictionary");
+    }
+    ts.ntex = nt.value;
+    ts.tex = alloc<NdsTexture>((int64)ts.ntex + 1);
+    for (i in 0..ts.ntex) {
+        int64 p = d.u32(e[i].data);
+        NdsTexture* x = &ts.tex[i];
+        x.name = e[i].name;
+        x.offset = (p & 0xFFFF) << 3;
+        x.width = 8 << (int)((p >> 20) & 7);
+        x.height = 8 << (int)((p >> 23) & 7);
+        x.format = (int)((p >> 26) & 7);
+        x.color0 = ((p >> 29) & 1) != 0;
+        x.repeat_s = ((p >> 16) & 1) != 0;
+        x.repeat_t = ((p >> 17) & 1) != 0;
+        x.flip_s = ((p >> 18) & 1) != 0;
+        x.flip_t = ((p >> 19) & 1) != 0;
+    }
+    free((*void)e);
+    Result<int, string> np = _nds_dict(d, t + d.u32(t + 0x34), &e, &unit);
+    if (!np.ok) {
+        NdsTexSet_free(&ts);
+        return Err<NdsTexSet, string>(np.error);
+    }
+    if (np.value > 0 && unit < 2) {
+        _nds_dict_free(e, np.value);
+        NdsTexSet_free(&ts);
+        return Err<NdsTexSet, string>("tex0: bad palette dictionary");
+    }
+    ts.npal = np.value;
+    ts.pal = alloc<NdsTexPalette>((int64)ts.npal + 1);
+    for (i in 0..ts.npal) {
+        ts.pal[i].name = e[i].name;
+        ts.pal[i].offset = (int64)d.u16(e[i].data) << 3;
+    }
+    free((*void)e);
+    return Ok<NdsTexSet, string>(ts);
+}
+
+int NdsTexSet_find(NdsTexSet* self, string name) {
+    for (i in 0..self.ntex) {
+        if (strcmp(self.tex[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+int NdsTexSet_find_palette(NdsTexSet* self, string name) {
+    for (i in 0..self.npal) {
+        if (strcmp(self.pal[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+// The palette a texture uses when nothing else says: the one with the
+// texture's name, else the one named "<texture>_pl" (map texture sets pair
+// them so), else the first; -1 when the set has no palettes.
+int NdsTexSet_palette_for(NdsTexSet* self, int tex) {
+    if (self.npal == 0) return -1;
+    if (tex >= 0 && tex < self.ntex) {
+        string n = self.tex[tex].name;
+        int same = self.find_palette(n);
+        if (same >= 0) return same;
+        int pl = _tex_find_pl(self, n);
+        if (pl >= 0) return pl;
+    }
+    return 0;
+}
+
+// The palette named "<name>_pl", or -1.
+int _tex_find_pl(NdsTexSet* self, string n) {
+    int64 ln = strlen(n);
+    for (i in 0..self.npal) {
+        string p = self.pal[i].name;
+        if (strlen(p) == ln + 3 && strncmp(p, n, ln) == 0 && p[ln] == '_' && p[ln + 1] == 'p' && p[ln + 2] == 'l') return i;
+    }
+    return -1;
+}
+
+// BGR555 color k of the palette at poff, as 5-bit channels in r, g, b;
+// false (and magenta) when it is past the palette data.
+bool _tex_color5(NdsTexSet* ts, int64 poff, int64 k, *int r, *int g, *int b) {
+    int64 o = ts.pal_data + poff + k * 2;
+    int64 end = ts.pal_data + ts.pal_size;
+    if (end > ts.d.len) end = ts.d.len;
+    if (o < 0 || o + 2 > end) {
+        *r = 31;
+        *g = 0;
+        *b = 31;
+        return false;
+    }
+    int c = ts.d.u16(o);
+    *r = c & 31;
+    *g = (c >> 5) & 31;
+    *b = (c >> 10) & 31;
+    return true;
+}
+
+int _c8(int c5) {
+    return c5 * 255 / 31;
+}
+
+void _tex_put(NdsImage* img, int x, int y, int r5, int g5, int b5, int a) {
+    img.set(x, y, _c8(r5), _c8(g5), _c8(b5), a);
+}
+
+// Texture tex decoded with palette pal (an index of the set's palettes; -1
+// for none, which only direct-color textures need). Pixels past the data
+// read as 0 and colors past the palette are magenta.
+Result<NdsImage, string> NdsTexSet_image(NdsTexSet* self, int tex, int pal) {
+    if (tex < 0 || tex >= self.ntex) return Err<NdsImage, string>("tex0: no such texture");
+    NdsTexture* t = &self.tex[tex];
+    NdsData* d = &self.d;
+    int w = t.width;
+    int h = t.height;
+    int64 poff = pal >= 0 && pal < self.npal ? self.pal[pal].offset : (int64)0;
+    NdsImage img = NdsImage_new(w, h);
+    int r = 0;
+    int g = 0;
+    int b = 0;
+    int64 base = self.tex_data + t.offset;
+    int f = t.format;
+    if (f == NDS_TEX_4 || f == NDS_TEX_16 || f == NDS_TEX_256) {
+        int bpp = f == NDS_TEX_4 ? 2 : (f == NDS_TEX_16 ? 4 : 8);
+        int per = 8 / bpp;
+        int mask = (1 << bpp) - 1;
+        int64 nbytes = (int64)w * (int64)h * (int64)bpp / 8;
+        for (int64 i = 0; i < (int64)w * (int64)h; i++) {
+            int64 bi = i / (int64)per;
+            int byte = bi < nbytes ? d.u8(base + bi) : 0;
+            int c = (byte >> ((int)(i % (int64)per) * bpp)) & mask;
+            if (c == 0 && t.color0) continue;
+            _tex_color5(self, poff, (int64)c, &r, &g, &b);
+            _tex_put(&img, (int)(i % (int64)w), (int)(i / (int64)w), r, g, b, 255);
+        }
+    } else if (f == NDS_TEX_A3I5 || f == NDS_TEX_A5I3) {
+        for (int64 i = 0; i < (int64)w * (int64)h; i++) {
+            int byte = d.u8(base + i);
+            int c = 0;
+            int a5 = 0;
+            if (f == NDS_TEX_A3I5) {
+                c = byte & 31;
+                int a3 = byte >> 5;
+                a5 = (a3 << 2) | (a3 >> 1);
+            } else {
+                c = byte & 7;
+                a5 = byte >> 3;
+            }
+            _tex_color5(self, poff, (int64)c, &r, &g, &b);
+            _tex_put(&img, (int)(i % (int64)w), (int)(i / (int64)w), r, g, b, _c8(a5));
+        }
+    } else if (f == NDS_TEX_DIRECT) {
+        for (int64 i = 0; i < (int64)w * (int64)h; i++) {
+            int c = d.u16(base + i * 2);
+            _tex_put(&img, (int)(i % (int64)w), (int)(i / (int64)w), c & 31, (c >> 5) & 31, (c >> 10) & 31, (c & 0x8000) != 0 ? 255 : 0);
+        }
+    } else if (f == NDS_TEX_4X4) {
+        int64 texel = self.cmp_data + t.offset;
+        int64 info = self.cmp_info + t.offset / 2;
+        int bw = w / 4;
+        int[12] col;
+        for (by in 0..h / 4) {
+            for (bx in 0..bw) {
+                int64 blk = (int64)by * (int64)bw + (int64)bx;
+                int64 word = d.u32(texel + blk * 4);
+                int pidx = d.u16(info + blk * 2);
+                int64 pbase = (int64)(pidx & 0x3FFF) * 2;
+                int mode = pidx >> 14;
+                int[4] alpha = {255, 255, 255, 255};
+                for (k in 0..4) {
+                    _tex_color5(self, poff, pbase + (int64)k, &r, &g, &b);
+                    col[k * 3] = r;
+                    col[k * 3 + 1] = g;
+                    col[k * 3 + 2] = b;
+                }
+                if (mode == 0) {
+                    alpha[3] = 0;
+                } else if (mode == 1) {
+                    for (ch in 0..3) col[6 + ch] = (col[ch] + col[3 + ch]) / 2;
+                    alpha[3] = 0;
+                } else if (mode == 3) {
+                    for (ch in 0..3) {
+                        col[6 + ch] = (col[ch] * 5 + col[3 + ch] * 3) / 8;
+                        col[9 + ch] = (col[ch] * 3 + col[3 + ch] * 5) / 8;
+                    }
+                }
+                for (y in 0..4) {
+                    int row = (int)((word >> (y * 8)) & 0xFF);
+                    for (x in 0..4) {
+                        int k = (row >> (x * 2)) & 3;
+                        if (alpha[k] == 0) continue;
+                        _tex_put(&img, bx * 4 + x, by * 4 + y, col[k * 3], col[k * 3 + 1], col[k * 3 + 2], 255);
+                    }
+                }
+            }
+        }
+    }
+    return Ok<NdsImage, string>(img);
+}
+
+// ---- models (NSBMD) ----
+
+struct NdsVertex {
+    float x;
+    float y;
+    float z;
+    float s;
+    float t;
+    float nx;
+    float ny;
+    float nz;
+    float r;
+    float g;
+    float b;
+}
+
+// The triangles drawn with one material, 3 vertices each. s and t are in
+// texels; divide by the texture's size for 0..1 coordinates.
+struct NdsMeshGroup {
+    int material;
+    List<NdsVertex> verts;
+    bool has_normals;
+    bool has_colors;
+}
+
+struct NdsMaterial {
+    string name;
+    string texture;
+    string palette;
+}
+
+struct NdsModel {
+    string name;
+    float scale;
+    int nmaterials;
+    *NdsMaterial materials;
+    List<NdsMeshGroup> groups;
+}
+
+void NdsModel_free(NdsModel* self) {
+    if (self.name != null) free((*void)self.name);
+    self.name = null;
+    if (self.materials != null) {
+        for (i in 0..self.nmaterials) {
+            if (self.materials[i].name != null) free((*void)self.materials[i].name);
+            if (self.materials[i].texture != null) free((*void)self.materials[i].texture);
+            if (self.materials[i].palette != null) free((*void)self.materials[i].palette);
+        }
+        free((*void)self.materials);
+    }
+    self.materials = null;
+    self.nmaterials = 0;
+    for (i in 0..self.groups.size) List_free<NdsVertex>(&self.groups.data[i].verts);
+    if (self.groups.data != null) List_free<NdsMeshGroup>(&self.groups);
+}
+
+// Triangle count of all the groups.
+int64 NdsModel_triangles(NdsModel* self) {
+    int64 n = 0;
+    for (i in 0..self.groups.size) n += (int64)self.groups.data[i].verts.size / 3;
+    return n;
+}
+
+// A signed fixed-point field: bits wide, frac fractional bits.
+float _fx(int64 v, int bits, int frac) {
+    int64 m = ((int64)1 << bits) - 1;
+    v = v & m;
+    if ((v & ((int64)1 << (bits - 1))) != 0) v -= (int64)1 << bits;
+    return (float)((double)v / (double)((int64)1 << frac));
+}
+
+// The palette for texture tex of ts as model m's materials pair them (the
+// first material drawing with that texture and naming a palette), else
+// NdsTexSet_palette_for's choice.
+int NdsModel_palette_for(NdsModel* self, NdsTexSet* ts, int tex) {
+    if (tex < 0 || tex >= ts.ntex) return ts.palette_for(tex);
+    for (i in 0..self.nmaterials) {
+        NdsMaterial* mt = &self.materials[i];
+        if (mt.texture == null || mt.palette == null || strcmp(mt.texture, ts.tex[tex].name) != 0) continue;
+        int p = ts.find_palette(mt.palette);
+        if (p >= 0) return p;
+    }
+    return ts.palette_for(tex);
+}
+
+// Parameter words of each GPU command, -1 for an unknown one.
+int _gpu_params(int op) {
+    if (op == 0x00 || op == 0x11 || op == 0x15 || op == 0x41) return 0;
+    if (op == 0x10 || op == 0x12 || op == 0x13 || op == 0x14) return 1;
+    if (op == 0x16 || op == 0x18) return 16;
+    if (op == 0x17 || op == 0x19) return 12;
+    if (op == 0x1A) return 9;
+    if (op == 0x1B || op == 0x1C) return 3;
+    if (op >= 0x20 && op <= 0x2B && op != 0x23) return 1;
+    if (op == 0x23) return 2;
+    if (op >= 0x30 && op <= 0x33) return 1;
+    if (op == 0x34) return 32;
+    if (op == 0x40 || op == 0x50 || op == 0x60 || op == 0x72) return 1;
+    if (op == 0x70) return 3;
+    if (op == 0x71) return 2;
+    return -1;
+}
+
+struct _GpuState {
+    int prim;
+    NdsVertex cur;
+    NdsVertex[4] strip;
+    int n;
+}
+
+void _gpu_emit(_GpuState* st, NdsMeshGroup* g) {
+    if (st.n < 4) {
+        st.strip[st.n] = st.cur;
+    } else {
+        for (k in 0..3) st.strip[k] = st.strip[k + 1];
+        st.strip[3] = st.cur;
+    }
+    st.n++;
+    int n = st.n;
+    int l = n < 4 ? n : 4;
+    if (st.prim == 0 && n % 3 == 0) {
+        g.verts.push(st.strip[l - 3]);
+        g.verts.push(st.strip[l - 2]);
+        g.verts.push(st.strip[l - 1]);
+    } else if (st.prim == 1 && n % 4 == 0) {
+        g.verts.push(st.strip[0]);
+        g.verts.push(st.strip[1]);
+        g.verts.push(st.strip[2]);
+        g.verts.push(st.strip[0]);
+        g.verts.push(st.strip[2]);
+        g.verts.push(st.strip[3]);
+    } else if (st.prim == 2 && n >= 3) {
+        if (n % 2 != 0) {
+            g.verts.push(st.strip[l - 3]);
+            g.verts.push(st.strip[l - 2]);
+        } else {
+            g.verts.push(st.strip[l - 2]);
+            g.verts.push(st.strip[l - 3]);
+        }
+        g.verts.push(st.strip[l - 1]);
+    } else if (st.prim == 3 && n >= 4 && n % 2 == 0) {
+        g.verts.push(st.strip[0]);
+        g.verts.push(st.strip[1]);
+        g.verts.push(st.strip[3]);
+        g.verts.push(st.strip[0]);
+        g.verts.push(st.strip[3]);
+        g.verts.push(st.strip[2]);
+    }
+}
+
+// Runs a piece's GPU command list, adding its triangles to g.
+string _gpu_run(NdsData cmds, NdsMeshGroup* g, float scale) {
+    let st: _GpuState;
+    st.cur.r = (float)1.0;
+    st.cur.g = (float)1.0;
+    st.cur.b = (float)1.0;
+    int64 o = 0;
+    while (o + 4 <= cmds.len) {
+        int64 word = cmds.u32(o);
+        o += 4;
+        for (k in 0..4) {
+            int op = (int)((word >> (k * 8)) & 0xFF);
+            int np = _gpu_params(op);
+            if (np < 0) return "nsbmd: unknown GPU command";
+            if (op == 0x00 && k > 0) continue;
+            if (!cmds.has(o, (int64)np * 4)) return null;
+            int64 p0 = cmds.u32(o);
+            int64 p1 = np > 1 ? cmds.u32(o + 4) : (int64)0;
+            o += (int64)np * 4;
+            bool vtx = true;
+            if (op == 0x40) {
+                st.prim = (int)(p0 & 3);
+                st.n = 0;
+                vtx = false;
+            } else if (op == 0x23) {
+                st.cur.x = _fx(p0, 16, 12);
+                st.cur.y = _fx(p0 >> 16, 16, 12);
+                st.cur.z = _fx(p1, 16, 12);
+            } else if (op == 0x24) {
+                st.cur.x = _fx(p0, 10, 6);
+                st.cur.y = _fx(p0 >> 10, 10, 6);
+                st.cur.z = _fx(p0 >> 20, 10, 6);
+            } else if (op == 0x25) {
+                st.cur.x = _fx(p0, 16, 12);
+                st.cur.y = _fx(p0 >> 16, 16, 12);
+            } else if (op == 0x26) {
+                st.cur.x = _fx(p0, 16, 12);
+                st.cur.z = _fx(p0 >> 16, 16, 12);
+            } else if (op == 0x27) {
+                st.cur.y = _fx(p0, 16, 12);
+                st.cur.z = _fx(p0 >> 16, 16, 12);
+            } else if (op == 0x28) {
+                st.cur.x = st.cur.x + _fx(p0, 10, 12);
+                st.cur.y = st.cur.y + _fx(p0 >> 10, 10, 12);
+                st.cur.z = st.cur.z + _fx(p0 >> 20, 10, 12);
+            } else {
+                vtx = false;
+                if (op == 0x20) {
+                    st.cur.r = (float)((double)(p0 & 31) / 31.0);
+                    st.cur.g = (float)((double)((p0 >> 5) & 31) / 31.0);
+                    st.cur.b = (float)((double)((p0 >> 10) & 31) / 31.0);
+                    g.has_colors = true;
+                } else if (op == 0x21) {
+                    st.cur.nx = _fx(p0, 10, 9);
+                    st.cur.ny = _fx(p0 >> 10, 10, 9);
+                    st.cur.nz = _fx(p0 >> 20, 10, 9);
+                    g.has_normals = true;
+                } else if (op == 0x22) {
+                    st.cur.s = _fx(p0, 16, 4);
+                    st.cur.t = _fx(p0 >> 16, 16, 4);
+                }
+            }
+            if (vtx) {
+                NdsVertex v = st.cur;
+                v.x = v.x * scale;
+                v.y = v.y * scale;
+                v.z = v.z * scale;
+                NdsVertex keep = st.cur;
+                st.cur = v;
+                _gpu_emit(&st, g);
+                st.cur = keep;
+            }
+        }
+    }
+    return null;
+}
+
+// Parameter bytes of each render command, -1 for an unknown one.
+int _render_params(int op) {
+    if (op == 0x00 || op == 0x01 || op == 0x0B || op == 0x2B || op == 0x40 || op == 0x80) return 0;
+    if (op == 0x02 || op == 0x0C || op == 0x0D || op == 0x47) return 2;
+    if (op == 0x03 || op == 0x04 || op == 0x05 || op == 0x07 || op == 0x08 || op == 0x24 || op == 0x44) return 1;
+    if (op == 0x06) return 3;
+    if (op == 0x26 || op == 0x46) return 4;
+    if (op == 0x66) return 5;
+    return -1;
+}
+
+// A dictionary whose entries are datum bytes each.
+Result<int, string> _nds_info_block(NdsData* d, int64 o, int datum, *_NdsDictEntry* out) {
+    *out = null;
+    if (!d.has(o, 12)) return Err<int, string>("nsbmd: dictionary out of range");
+    int count = d.u8(o + 1);
+    int64 p = o + 12 + 4 * (int64)count;
+    if (d.u16(p) != datum) return Err<int, string>("nsbmd: unexpected dictionary entry size");
+    int64 names = p + 4 + (int64)count * (int64)datum;
+    if (!d.has(p + 4, (int64)count * (int64)datum) || !d.has(names, (int64)count * 16)) return Err<int, string>("nsbmd: dictionary out of range");
+    *_NdsDictEntry e = alloc<_NdsDictEntry>((int64)count + 1);
+    for (i in 0..count) {
+        e[i].data = p + 4 + (int64)i * (int64)datum;
+        e[i].name = d.str(names + (int64)i * 16, 16);
+    }
+    *out = e;
+    return Ok<int, string>(count);
+}
+
+string _nds_dup(string s) {
+    int64 n = strlen(s);
+    *uint8 c = alloc<uint8>(n + 1);
+    memcpy((*void)c, (*void)s, n + 1);
+    return (string)c;
+}
+
+// Names the texture (or palette) of each material from a pairing
+// dictionary: each entry lists the materials that use that name.
+string _nds_pairs(NdsData* d, int64 mats, int64 pair, *string names, int nmat) {
+    *_NdsDictEntry e = null;
+    Result<int, string> n = _nds_info_block(d, mats + pair, 4, &e);
+    if (!n.ok) return n.error;
+    for (i in 0..n.value) {
+        int64 off = d.u16(e[i].data);
+        int num = d.u8(e[i].data + 2);
+        for (k in 0..num) {
+            int m = d.u8(mats + off + (int64)k);
+            if (m < nmat && names[m] == null) names[m] = _nds_dup(e[i].name);
+        }
+    }
+    _nds_dict_free(e, n.value);
+    return null;
+}
+
+NdsMeshGroup* _nds_group(NdsModel* m, int material) {
+    for (i in 0..m.groups.size) {
+        if (m.groups.data[i].material == material) return &m.groups.data[i];
+    }
+    let g: NdsMeshGroup;
+    g.material = material;
+    g.verts.init(64);
+    m.groups.push(g);
+    return &m.groups.data[m.groups.size - 1];
+}
+
+Result<NdsModel, string> _nsbmd_fail(NdsModel* m, string e) {
+    NdsModel_free(m);
+    return Err<NdsModel, string>(e);
+}
+
+// The first model of an NSBMD file: its materials and its triangles grouped
+// by material (material -1 for pieces drawn with none), positions times the
+// model's scale.
+Result<NdsModel, string> nsbmd_read(*uint8 data, int64 len) {
+    NdsData dd = NdsData{data: data, len: len};
+    NdsData* d = &dd;
+    if (!d.magic(0, "BMD0")) return Err<NdsModel, string>("nsbmd: not an NSBMD file");
+    let m: NdsModel;
+    m.groups.init(8);
+    int64 mdl0 = nds_block(d, "MDL0");
+    if (mdl0 < 0) return _nsbmd_fail(&m, "nsbmd: no MDL0 block");
+    *_NdsDictEntry e = null;
+    Result<int, string> nm = _nds_info_block(d, mdl0 + 8, 4, &e);
+    if (!nm.ok) return _nsbmd_fail(&m, nm.error);
+    if (nm.value < 1) {
+        _nds_dict_free(e, nm.value);
+        return _nsbmd_fail(&m, "nsbmd: no models");
+    }
+    int64 mo = mdl0 + d.u32(e[0].data);
+    m.name = _nds_dup(e[0].name);
+    _nds_dict_free(e, nm.value);
+    if (!d.has(mo, 0x20)) return _nsbmd_fail(&m, "nsbmd: model out of range");
+    int64 render = mo + d.u32(mo + 4);
+    int64 mats = mo + d.u32(mo + 8);
+    int64 pieces = mo + d.u32(mo + 12);
+    m.scale = _fx(d.u32(mo + 0x1C), 32, 12);
+    if (!d.has(mats, 6)) return _nsbmd_fail(&m, "nsbmd: materials out of range");
+    int64 tex_pair = d.u16(mats);
+    int64 pal_pair = d.u16(mats + 2);
+    Result<int, string> nmat = _nds_info_block(d, mats + 4, 4, &e);
+    if (!nmat.ok) return _nsbmd_fail(&m, nmat.error);
+    m.nmaterials = nmat.value;
+    m.materials = alloc<NdsMaterial>((int64)m.nmaterials + 1);
+    *string tex = alloc<string>((int64)m.nmaterials + 1);
+    *string pal = alloc<string>((int64)m.nmaterials + 1);
+    for (i in 0..m.nmaterials) m.materials[i].name = _nds_dup(e[i].name);
+    _nds_dict_free(e, nmat.value);
+    string err = _nds_pairs(d, mats, tex_pair, tex, m.nmaterials);
+    if (err == null) err = _nds_pairs(d, mats, pal_pair, pal, m.nmaterials);
+    for (i in 0..m.nmaterials) {
+        m.materials[i].texture = tex[i];
+        m.materials[i].palette = pal[i];
+    }
+    free((*void)tex);
+    free((*void)pal);
+    if (err != null) return _nsbmd_fail(&m, err);
+    Result<int, string> npc = _nds_info_block(d, pieces, 4, &e);
+    if (!npc.ok) return _nsbmd_fail(&m, npc.error);
+    int npieces = npc.value;
+    *NdsData cmds = alloc<NdsData>((int64)npieces + 1);
+    for (i in 0..npieces) {
+        int64 p = pieces + d.u32(e[i].data);
+        int64 co = p + d.u32(p + 8);
+        int64 cl = d.u32(p + 12);
+        if (co > len) co = len;
+        if (cl > len - co) cl = len - co;
+        cmds[i] = d.sub(co, cl);
+    }
+    _nds_dict_free(e, npieces);
+    int mat = -1;
+    int64 o = render;
+    string bad = null;
+    while (o < len) {
+        int op = d.u8(o);
+        o++;
+        if (op == 0x01) break;
+        if (op == 0x09) {
+            // skinning: index, term count, 3 bytes a term
+            o += 2 + 3 * (int64)d.u8(o + 1);
+            continue;
+        }
+        int n = _render_params(op);
+        if (n < 0) {
+            bad = "nsbmd: unknown render command";
+            break;
+        }
+        int p0 = d.u8(o);
+        o += (int64)n;
+        if (op == 0x04 || op == 0x24 || op == 0x44) {
+            mat = p0;
+        } else if (op == 0x05) {
+            if (p0 >= npieces) continue;
+            int gm = mat >= 0 && mat < m.nmaterials ? mat : -1;
+            NdsMeshGroup* g = _nds_group(&m, gm);
+            bad = _gpu_run(cmds[p0], g, m.scale);
+            if (bad != null) break;
+        }
+    }
+    free((*void)cmds);
+    if (bad != null) return _nsbmd_fail(&m, bad);
+    return Ok<NdsModel, string>(m);
+}
