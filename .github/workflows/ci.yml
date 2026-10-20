@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu
+        run: |
+          curl -fsSL https://eskiu-lang.org/install.sh | ESKIU_PREFIX=$HOME/.eskiu sh
+          echo "$HOME/.eskiu/bin" >> $GITHUB_PATH
+      - name: Tests
+        run: eskiuc test
+      - name: Tests (-O2)
+        run: eskiuc test -O2
+      - name: PNG output read by Python
+        run: |
+          mkdir -p build/png
+          eskiuc examples/nds_textures.esk -o build/nds_textures
+          build/nds_textures tests/data/test.nsbtx build/png
+          python3 -I tools/check_png.py build/png
+      - name: Examples build
+        run: |
+          mkdir -p build
+          for f in examples/*.esk; do eskiuc "$f" -o build/$(basename "$f" .esk); done
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu
+        run: brew install eskiu-lang/eskiu/eskiu
+      - name: Tests
+        run: eskiuc test
+      - name: Tests (-O2)
+        run: eskiuc test -O2
+      - name: PNG output read by Python
+        run: |
+          mkdir -p build/png
+          eskiuc examples/nds_textures.esk -o build/nds_textures
+          build/nds_textures tests/data/test.nsbtx build/png
+          python3 -I tools/check_png.py build/png
+      - name: Examples build
+        run: |
+          mkdir -p build
+          for f in examples/*.esk; do eskiuc "$f" -o build/$(basename "$f" .esk); done
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc unzip
+      - name: Install Eskiu
+        run: |
+          curl -fsSL -o eskiu.zip https://github.com/eskiu-lang/eskiu/releases/latest/download/eskiuc-windows-x86_64.zip
+          # The archive's paths use backslashes; unzip extracts it and exits with 1 (a warning).
+          unzip -q eskiu.zip -d $HOME/eskiu || [ $? -eq 1 ]
+          test -x $HOME/eskiu/bin/eskiuc.exe
+      - name: Tests
+        run: |
+          export PATH="$HOME/eskiu/bin:$PATH"
+          CC=gcc eskiuc test
+      - name: Examples build
+        run: |
+          export PATH="$HOME/eskiu/bin:$PATH"
+          mkdir -p build
+          for f in examples/*.esk; do CC=gcc eskiuc "$f" -o build/$(basename "$f" .esk); done
