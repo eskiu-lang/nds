@@ -1,0 +1,49 @@
+// Renders a sequence of an SDAT to a WAV file.
+//
+//     eskiuc run examples/sdat_play.esk sound_data.sdat SEQ_BGM_FIELD 30 field.wav
+//     eskiuc run examples/sdat_play.esk sound_data.sdat 1100 30 field.wav loop
+//
+// The sequence is a name or an index. With "loop" the song plays through its
+// loop point until the time is up; without it, it stops there.
+import <io>;
+import <mem>;
+import <string>;
+import <nds/sdat>;
+import <nds/wav>;
+
+extern double atof(string s);
+extern int atoi(string s);
+
+Result<int, string> play(string path, string name, double seconds, string out, bool looping) {
+    Sdat s = Sdat_open(path)?;
+    defer s.close();
+    int seq = s.seq_find(name);
+    if (seq < 0 && name[0] >= '0' && name[0] <= '9') seq = atoi(name);
+    SdatPlayer p = SdatPlayer_open(&s, seq, looping)?;
+    defer p.free();
+    int64 frames = (int64)(48000.0 * seconds);
+    Pcm16 pcm = Pcm16{data: alloc<int16>(frames * 2 + 2), frames: 0, channels: 2, rate: SDAT_RATE};
+    defer pcm.free();
+    // in blocks, as a real-time player would
+    while (pcm.frames < frames) {
+        int64 want = frames - pcm.frames;
+        if (want > 4096) want = 4096;
+        int64 got = p.render(pcm.data + pcm.frames * 2, want);
+        pcm.frames += got;
+        if (got < want) break;
+    }
+    pcm.write_wav(out)?;
+    printf("%lld s -> %s\n", pcm.frames / 48000, out);
+    return Ok<int, string>(0);
+}
+
+if (argc < 5) {
+    printf("usage: sdat_play SDAT SEQUENCE SECONDS OUT.wav [loop]\n");
+    return 1;
+}
+
+Result<int, string> r = play(argv[1], argv[2], atof(argv[3]), argv[4], argc > 5 && strcmp(argv[5], "loop") == 0);
+if (!r.ok) {
+    printf("error: %s\n", r.error);
+    return 1;
+}
