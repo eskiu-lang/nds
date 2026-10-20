@@ -1,0 +1,85 @@
+// bin.esk: bounds-checked little-endian reads over a byte buffer, shared by
+// every format in the package. A read that would go past the end gives 0, so
+// a parser never touches memory outside the buffer it was handed.
+//
+//     NdsData d = NdsData{data: p, len: n};
+//     uint32 magic = d.u32(0);
+//     if (!d.has(off, 16)) return Err<X, string>("narc: truncated");
+
+import <mem>;
+import <fs>;
+import <result>;
+
+// A view of bytes owned elsewhere.
+struct NdsData {
+    *uint8 data;
+    int64 len;
+}
+
+NdsData nds_data(*uint8 data, int64 len) {
+    return NdsData{data: data, len: len};
+}
+
+// True when the n bytes at off are inside the buffer.
+bool NdsData_has(NdsData* self, int64 off, int64 n) {
+    return off >= 0 && n >= 0 && off <= self.len && n <= self.len - off;
+}
+
+int NdsData_u8(NdsData* self, int64 off) {
+    if (!self.has(off, 1)) return 0;
+    return (int)self.data[off];
+}
+
+int NdsData_u16(NdsData* self, int64 off) {
+    if (!self.has(off, 2)) return 0;
+    return (int)self.data[off] | ((int)self.data[off + 1] << 8);
+}
+
+int NdsData_s16(NdsData* self, int64 off) {
+    return (int)(int16)(uint16)self.u16(off);
+}
+
+int64 NdsData_u32(NdsData* self, int64 off) {
+    if (!self.has(off, 4)) return 0;
+    *uint8 p = self.data + off;
+    return (int64)p[0] | ((int64)p[1] << 8) | ((int64)p[2] << 16) | ((int64)p[3] << 24);
+}
+
+int NdsData_s32(NdsData* self, int64 off) {
+    return (int)(uint32)self.u32(off);
+}
+
+// True when the buffer holds the 4 ASCII bytes of magic at off.
+bool NdsData_magic(NdsData* self, int64 off, string magic) {
+    if (!self.has(off, 4)) return false;
+    for (i in 0..4) {
+        if (self.data[off + i] != (uint8)magic[i]) return false;
+    }
+    return true;
+}
+
+// The bytes [off, off + n) as a view, or an empty view when they are not all
+// inside the buffer.
+NdsData NdsData_sub(NdsData* self, int64 off, int64 n) {
+    if (!self.has(off, n)) return NdsData{data: null, len: 0};
+    return NdsData{data: self.data + off, len: n};
+}
+
+// A NUL-terminated copy of the string at off, at most max bytes and never
+// past the end of the buffer. Free it with free().
+string NdsData_str(NdsData* self, int64 off, int64 max) {
+    int64 n = 0;
+    while (n < max && self.has(off + n, 1) && self.data[off + n] != 0) n++;
+    *uint8 s = alloc<uint8>(n + 1);
+    if (n > 0) memcpy((*void)s, (*void)(self.data + off), n);
+    s[n] = 0;
+    return (string)s;
+}
+
+// A whole file read into memory, freed with free(). The error names the path.
+Result<NdsData, string> nds_read_file(string path) {
+    int64 n = 0;
+    *uint8 p = fs_read_all(path, &n);
+    if (p == null) return Err<NdsData, string>("nds: cannot read the file");
+    return Ok<NdsData, string>(NdsData{data: p, len: n});
+}

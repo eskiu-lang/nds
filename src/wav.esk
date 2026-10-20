@@ -1,0 +1,67 @@
+// wav.esk: 16-bit PCM buffers and WAV files.
+//
+//     Pcm16 pcm = ...;                  // from Sdat_render
+//     pcm.write_wav("out.wav")?;
+//     Bytes b = pcm.wav_bytes();        // the same file in memory
+
+import <mem>;
+import <fs>;
+import <bytes>;
+import <result>;
+
+// Interleaved samples: frames * channels values, left first for stereo.
+struct Pcm16 {
+    *int16 data;
+    int64 frames;
+    int channels;
+    int rate;
+}
+
+void Pcm16_free(Pcm16* self) {
+    if (self.data != null) free((*void)self.data);
+    self.data = null;
+    self.frames = 0;
+}
+
+void _wav_put16(Bytes* b, int64 v) {
+    b.push((uint8)(v & 0xFF));
+    b.push((uint8)((v >> 8) & 0xFF));
+}
+
+void _wav_put32(Bytes* b, int64 v) {
+    _wav_put16(b, v & 0xFFFF);
+    _wav_put16(b, (v >> 16) & 0xFFFF);
+}
+
+// A RIFF WAVE file: the 44-byte header, then the samples little-endian.
+Bytes wav_bytes(*int16 data, int64 frames, int channels, int rate) {
+    int64 n = frames * (int64)channels * 2;
+    let b: Bytes;
+    b.init(n + 44);
+    b.append_raw((*uint8)"RIFF", 4);
+    _wav_put32(&b, 36 + n);
+    b.append_raw((*uint8)"WAVEfmt ", 8);
+    _wav_put32(&b, 16);
+    _wav_put16(&b, 1);
+    _wav_put16(&b, (int64)channels);
+    _wav_put32(&b, (int64)rate);
+    _wav_put32(&b, (int64)rate * (int64)channels * 2);
+    _wav_put16(&b, (int64)channels * 2);
+    _wav_put16(&b, 16);
+    b.append_raw((*uint8)"data", 4);
+    _wav_put32(&b, n);
+    for (int64 i = 0; i < frames * (int64)channels; i++) _wav_put16(&b, (int64)data[i]);
+    return b;
+}
+
+Bytes Pcm16_wav_bytes(Pcm16* self) {
+    return wav_bytes(self.data, self.frames, self.channels, self.rate);
+}
+
+Result<int, string> Pcm16_write_wav(Pcm16* self, string path) {
+    Bytes b = self.wav_bytes();
+    int ok = fs_write_all(path, b.data, b.len);
+    b.free();
+    if (ok == 0) return Err<int, string>("wav: cannot write the file");
+    return Ok<int, string>(0);
+}
