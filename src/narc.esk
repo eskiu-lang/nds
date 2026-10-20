@@ -1,0 +1,218 @@
+// narc.esk: NARC archives (the "a/0/0/4" files of a ROM), by index or by
+// path.
+//
+//     Narc n = Narc_open("pokegra.narc")?;
+//     defer n.close();
+//     for (i in 0..n.count()) printf("%d %lld\n", i, n.file(i).len);
+//     NdsData f = n.file_path("data/model.nsbmd");   // when the NARC has names
+//
+// A NARC has three blocks: BTAF (FATB, start and end of each file), BTNF
+// (FNTB, the directory tree; most NARCs have none and only a root) and GMIF
+// (FIMG, the file data). The archive's memory is the caller's (Narc_from) or
+// owned (Narc_open); file views point into it. The same directory tree
+// format is used by a ROM's FNT, see <nds/rom>.
+
+import <mem>;
+import <fs>;
+import <list>;
+import <result>;
+import <nds/bin>;
+
+// File names of a directory tree: names[id] is the path of file id ("a/0/0"
+// style, no leading slash), or null for a file with no name.
+struct NdsNames {
+    int count;
+    *string names;
+}
+
+void NdsNames_free(NdsNames* self) {
+    if (self.names != null) {
+        for (i in 0..self.count) {
+            if (self.names[i] != null) free((*void)self.names[i]);
+        }
+        free((*void)self.names);
+    }
+    self.names = null;
+    self.count = 0;
+}
+
+// The file id of path, or -1.
+int NdsNames_find(NdsNames* self, string path) {
+    for (i in 0..self.count) {
+        if (self.names[i] != null && strcmp(self.names[i], path) == 0) return i;
+    }
+    return -1;
+}
+
+string _nds_join(string prefix, *uint8 name, int n, bool slash) {
+    int64 pl = prefix == null ? (int64)0 : strlen(prefix);
+    *uint8 s = alloc<uint8>(pl + (int64)n + 2);
+    if (pl > 0) memcpy((*void)s, (*void)prefix, pl);
+    memcpy((*void)(s + pl), (*void)name, (int64)n);
+    int64 e = pl + (int64)n;
+    if (slash) {
+        s[e] = (uint8)'/';
+        e++;
+    }
+    s[e] = 0;
+    return (string)s;
+}
+
+string _nds_walk(NdsData* d, int64 fnt, int ndirs, int dir, string prefix, NdsNames* out, int depth) {
+    if (depth > 64) return "fnt: directories nested too deep";
+    int idx = dir & 0xFFF;
+    if (idx >= ndirs) return "fnt: bad directory id";
+    int64 ent = fnt + (int64)idx * 8;
+    if (!d.has(ent, 8)) return "fnt: truncated";
+    int64 p = fnt + d.u32(ent);
+    int fid = d.u16(ent + 4);
+    while (true) {
+        if (!d.has(p, 1)) return "fnt: truncated";
+        int t = d.u8(p);
+        p++;
+        if (t == 0) break;
+        int ln = t & 0x7F;
+        if (!d.has(p, (int64)ln)) return "fnt: truncated";
+        *uint8 name = d.data + p;
+        p += (int64)ln;
+        if ((t & 0x80) != 0) {
+            if (!d.has(p, 2)) return "fnt: truncated";
+            int sub = d.u16(p);
+            p += 2;
+            string sp = _nds_join(prefix, name, ln, true);
+            string e = _nds_walk(d, fnt, ndirs, sub, sp, out, depth + 1);
+            free((*void)sp);
+            if (e != null) return e;
+        } else {
+            if (fid < out.count && out.names[fid] == null) out.names[fid] = _nds_join(prefix, name, ln, false);
+            fid++;
+        }
+    }
+    return null;
+}
+
+// Reads the directory tree at fnt (the FNT of a ROM, the FNTB block's data of
+// a NARC) for nfiles files.
+Result<NdsNames, string> nds_names(NdsData d, int64 fnt, int nfiles) {
+    let n: NdsNames;
+    n.count = nfiles;
+    n.names = alloc<string>((int64)nfiles + 1);
+    if (!d.has(fnt, 8)) {
+        NdsNames_free(&n);
+        return Err<NdsNames, string>("fnt: truncated");
+    }
+    int ndirs = d.u16(fnt + 6);
+    if (ndirs < 1 || ndirs > 4096) {
+        NdsNames_free(&n);
+        return Err<NdsNames, string>("fnt: bad directory count");
+    }
+    string e = _nds_walk(&d, fnt, ndirs, 0xF000, null, &n, 0);
+    if (e != null) {
+        NdsNames_free(&n);
+        return Err<NdsNames, string>(e);
+    }
+    return Ok<NdsNames, string>(n);
+}
+
+struct Narc {
+    NdsData d;
+    bool owned;
+    int nfiles;
+    *int64 starts;
+    *int64 ends;
+    int64 base;
+    int64 img_len;
+    NdsNames names;
+}
+
+Result<Narc, string> Narc_from(*uint8 data, int64 len) {
+    let n: Narc;
+    n.d = NdsData{data: data, len: len};
+    NdsData* d = &n.d;
+    if (!d.magic(0, "NARC")) return Err<Narc, string>("narc: not a NARC file");
+    int64 off = d.u16(12);
+    if (!d.magic(off, "BTAF")) return Err<Narc, string>("narc: no BTAF block");
+    int64 btaf_size = d.u32(off + 4);
+    int64 count = d.u32(off + 8);
+    if (count > (len - off - 12) / 8 || btaf_size < 12 + count * 8) return Err<Narc, string>("narc: truncated BTAF block");
+    int64 fntb = off + btaf_size;
+    if (!d.magic(fntb, "BTNF")) return Err<Narc, string>("narc: no BTNF block");
+    int64 fntb_size = d.u32(fntb + 4);
+    int64 gmif = fntb + fntb_size;
+    if (fntb_size < 8 || !d.magic(gmif, "GMIF")) return Err<Narc, string>("narc: no GMIF block");
+    n.base = gmif + 8;
+    n.img_len = len - n.base;
+    n.nfiles = (int)count;
+    n.starts = alloc<int64>(count + 1);
+    n.ends = alloc<int64>(count + 1);
+    for (int64 i = 0; i < count; i++) {
+        int64 s = d.u32(off + 12 + i * 8);
+        int64 e = d.u32(off + 16 + i * 8);
+        if (e < s || e > n.img_len) {
+            free((*void)n.starts);
+            free((*void)n.ends);
+            return Err<Narc, string>("narc: file out of range");
+        }
+        n.starts[i] = s;
+        n.ends[i] = e;
+    }
+    // A FNTB of only the root's 8-byte entry, with no names, is the usual case.
+    Result<NdsNames, string> names = nds_names(n.d.sub(fntb + 8, fntb_size - 8), 0, n.nfiles);
+    if (names.ok) {
+        n.names = names.value;
+    } else {
+        n.names = NdsNames{count: 0, names: null};
+    }
+    return Ok<Narc, string>(n);
+}
+
+Result<Narc, string> Narc_open(string path) {
+    int64 n = 0;
+    *uint8 p = fs_read_all(path, &n);
+    if (p == null) return Err<Narc, string>("narc: cannot read the file");
+    Result<Narc, string> r = Narc_from(p, n);
+    if (!r.ok) {
+        free((*void)p);
+        return r;
+    }
+    r.value.owned = true;
+    return r;
+}
+
+void Narc_close(Narc* self) {
+    if (self.starts != null) free((*void)self.starts);
+    if (self.ends != null) free((*void)self.ends);
+    NdsNames_free(&self.names);
+    if (self.owned && self.d.data != null) free((*void)self.d.data);
+    self.starts = null;
+    self.ends = null;
+    self.nfiles = 0;
+    self.d = NdsData{data: null, len: 0};
+    self.owned = false;
+}
+
+int Narc_count(Narc* self) {
+    return self.nfiles;
+}
+
+// File i as a view into the archive; empty when i is out of range.
+NdsData Narc_file(Narc* self, int i) {
+    if (i < 0 || i >= self.nfiles) return NdsData{data: null, len: 0};
+    return self.d.sub(self.base + self.starts[i], self.ends[i] - self.starts[i]);
+}
+
+// The path of file i, or null when the archive has no names.
+string Narc_name(Narc* self, int i) {
+    if (i < 0 || i >= self.names.count) return null;
+    return self.names.names[i];
+}
+
+// The index of the file at path, or -1.
+int Narc_find(Narc* self, string path) {
+    return self.names.find(path);
+}
+
+// The file at path; an empty view when there is none.
+NdsData Narc_file_path(Narc* self, string path) {
+    return self.file(self.find(path));
+}

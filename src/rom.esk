@@ -1,0 +1,197 @@
+// rom.esk: a .nds ROM's header, its file system (FNT and FAT) and its ARM9
+// overlays.
+//
+//     NdsRom rom = NdsRom_open("game.nds")?;
+//     defer rom.close();
+//     printf("%s %s, %d files\n", rom.title, rom.code, rom.count());
+//     NdsData f = rom.file_path("a/0/0/4");                 // a NARC
+//     Bytes ov = rom.overlay(12)?;                           // decompressed
+//     defer ov.free();
+//
+// File ids count from 0 over the whole FAT: overlays and the ARM9/ARM7
+// binaries' overlay files come first and have no name.
+
+import <mem>;
+import <fs>;
+import <bytes>;
+import <result>;
+import <nds/bin>;
+import <nds/narc>;
+import <nds/lz>;
+
+struct NdsOverlay {
+    int id;
+    int64 ram;
+    int64 ram_size;
+    int64 bss_size;
+    int file;
+    bool compressed;
+}
+
+struct NdsRom {
+    NdsData d;
+    bool owned;
+    string title;
+    string code;
+    string maker;
+    int unit;
+    int version;
+    int64 arm9_off;
+    int64 arm9_entry;
+    int64 arm9_ram;
+    int64 arm9_size;
+    int64 arm7_off;
+    int64 arm7_entry;
+    int64 arm7_ram;
+    int64 arm7_size;
+    int64 banner_off;
+    int nfiles;
+    *int64 starts;
+    *int64 ends;
+    NdsNames names;
+    int noverlays;
+    *NdsOverlay overlays;
+}
+
+Result<NdsRom, string> NdsRom_from(*uint8 data, int64 len) {
+    let r: NdsRom;
+    r.d = NdsData{data: data, len: len};
+    NdsData* d = &r.d;
+    if (len < 0x200) return Err<NdsRom, string>("rom: too short for a header");
+    int64 fnt = d.u32(0x40);
+    int64 fnt_size = d.u32(0x44);
+    int64 fat = d.u32(0x48);
+    int64 fat_size = d.u32(0x4C);
+    if (!d.has(fat, fat_size) || !d.has(fnt, fnt_size)) return Err<NdsRom, string>("rom: FNT or FAT out of range");
+    r.title = d.str(0, 12);
+    r.code = d.str(0x0C, 4);
+    r.maker = d.str(0x10, 2);
+    r.unit = d.u8(0x12);
+    r.version = d.u8(0x1E);
+    r.arm9_off = d.u32(0x20);
+    r.arm9_entry = d.u32(0x24);
+    r.arm9_ram = d.u32(0x28);
+    r.arm9_size = d.u32(0x2C);
+    r.arm7_off = d.u32(0x30);
+    r.arm7_entry = d.u32(0x34);
+    r.arm7_ram = d.u32(0x38);
+    r.arm7_size = d.u32(0x3C);
+    r.banner_off = d.u32(0x68);
+    int64 n = fat_size / 8;
+    r.nfiles = (int)n;
+    r.starts = alloc<int64>(n + 1);
+    r.ends = alloc<int64>(n + 1);
+    for (int64 i = 0; i < n; i++) {
+        r.starts[i] = d.u32(fat + i * 8);
+        r.ends[i] = d.u32(fat + i * 8 + 4);
+    }
+    Result<NdsNames, string> names = nds_names(d.sub(fnt, fnt_size), 0, r.nfiles);
+    if (!names.ok) {
+        NdsRom_close(&r);
+        return Err<NdsRom, string>(names.error);
+    }
+    r.names = names.value;
+    int64 ov = d.u32(0x50);
+    int64 ov_size = d.u32(0x54);
+    if (ov != 0 && d.has(ov, ov_size)) {
+        int64 m = ov_size / 32;
+        r.noverlays = (int)m;
+        r.overlays = alloc<NdsOverlay>(m + 1);
+        for (int64 i = 0; i < m; i++) {
+            int64 o = ov + i * 32;
+            r.overlays[i] = NdsOverlay{id: d.s32(o), ram: d.u32(o + 4), ram_size: d.u32(o + 8), bss_size: d.u32(o + 12), file: d.s32(o + 24), compressed: (d.u32(o + 28) & 0x01000000) != 0};
+        }
+    }
+    return Ok<NdsRom, string>(r);
+}
+
+Result<NdsRom, string> NdsRom_open(string path) {
+    int64 n = 0;
+    *uint8 p = fs_read_all(path, &n);
+    if (p == null) return Err<NdsRom, string>("rom: cannot read the file");
+    Result<NdsRom, string> r = NdsRom_from(p, n);
+    if (!r.ok) {
+        free((*void)p);
+        return r;
+    }
+    r.value.owned = true;
+    return r;
+}
+
+void NdsRom_close(NdsRom* self) {
+    if (self.title != null) free((*void)self.title);
+    if (self.code != null) free((*void)self.code);
+    if (self.maker != null) free((*void)self.maker);
+    if (self.starts != null) free((*void)self.starts);
+    if (self.ends != null) free((*void)self.ends);
+    if (self.overlays != null) free((*void)self.overlays);
+    NdsNames_free(&self.names);
+    if (self.owned && self.d.data != null) free((*void)self.d.data);
+    self.title = null;
+    self.code = null;
+    self.maker = null;
+    self.starts = null;
+    self.ends = null;
+    self.overlays = null;
+    self.nfiles = 0;
+    self.noverlays = 0;
+    self.d = NdsData{data: null, len: 0};
+    self.owned = false;
+}
+
+int NdsRom_count(NdsRom* self) {
+    return self.nfiles;
+}
+
+// File id as a view into the ROM; empty when the id or its FAT entry is bad.
+NdsData NdsRom_file(NdsRom* self, int id) {
+    if (id < 0 || id >= self.nfiles || self.ends[id] < self.starts[id]) return NdsData{data: null, len: 0};
+    return self.d.sub(self.starts[id], self.ends[id] - self.starts[id]);
+}
+
+// The path of file id ("a/0/0/4"), or null for an unnamed file.
+string NdsRom_name(NdsRom* self, int id) {
+    if (id < 0 || id >= self.names.count) return null;
+    return self.names.names[id];
+}
+
+int NdsRom_find(NdsRom* self, string path) {
+    return self.names.find(path);
+}
+
+NdsData NdsRom_file_path(NdsRom* self, string path) {
+    return self.file(self.find(path));
+}
+
+// The NARC at path. It points into the ROM: close it before the ROM.
+Result<Narc, string> NdsRom_narc(NdsRom* self, string path) {
+    NdsData f = self.file_path(path);
+    if (f.data == null) return Err<Narc, string>("rom: no such file");
+    return Narc_from(f.data, f.len);
+}
+
+// The ARM9 binary as stored (the main program; often BLZ-compressed).
+NdsData NdsRom_arm9(NdsRom* self) {
+    return self.d.sub(self.arm9_off, self.arm9_size);
+}
+
+// The index in rom.overlays of the ARM9 overlay with this id, or -1.
+int NdsRom_overlay_index(NdsRom* self, int id) {
+    for (i in 0..self.noverlays) {
+        if (self.overlays[i].id == id) return i;
+    }
+    return -1;
+}
+
+// ARM9 overlay id, decompressed when its table entry says it is compressed.
+Result<Bytes, string> NdsRom_overlay(NdsRom* self, int id) {
+    int i = self.overlay_index(id);
+    if (i < 0) return Err<Bytes, string>("rom: no such overlay");
+    NdsData f = self.file(self.overlays[i].file);
+    if (f.data == null) return Err<Bytes, string>("rom: overlay file out of range");
+    if (self.overlays[i].compressed) return nds_blz_decompress(f.data, f.len);
+    let b: Bytes;
+    b.init(f.len + 1);
+    b.append_raw(f.data, f.len);
+    return Ok<Bytes, string>(b);
+}

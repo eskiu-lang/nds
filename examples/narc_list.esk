@@ -1,0 +1,82 @@
+// Lists the files of a NARC archive, or of a ROM's file system.
+//
+//     eskiuc run examples/narc_list.esk archive.narc
+//     eskiuc run examples/narc_list.esk game.nds [PREFIX]
+//     eskiuc run examples/narc_list.esk game.nds a/0/0/4      # a NARC in the ROM
+import <io>;
+import <mem>;
+import <string>;
+import <nds/bin>;
+import <nds/narc>;
+import <nds/rom>;
+import <nds/lz>;
+
+// The first bytes of a file as its type: the 4-character magic most DS
+// formats start with, or "lz" for compressed data.
+void kind(NdsData f, *uint8 out) {
+    out[0] = 0;
+    if (nds_is_lz(f.data, f.len)) {
+        out[0] = (uint8)'l';
+        out[1] = (uint8)'z';
+        out[2] = 0;
+        return;
+    }
+    if (f.len < 4) return;
+    for (i in 0..4) {
+        uint8 c = f.data[i];
+        if (c < 32 || c > 126) {
+            out[0] = 0;
+            return;
+        }
+        out[i] = c;
+    }
+    out[4] = 0;
+}
+
+void list_narc(Narc* n) {
+    uint8[8] k;
+    for (i in 0..n.count()) {
+        NdsData f = n.file(i);
+        kind(f, &k[0]);
+        string name = n.name(i);
+        printf("%5d %10lld  %-4s  %s\n", i, f.len, (string)&k[0], name == null ? "" : name);
+    }
+}
+
+Result<int, string> run(string path, string prefix) {
+    NdsData d = nds_read_file(path)?;
+    defer free((*void)d.data);
+    if (d.magic(0, "NARC")) {
+        Narc n = Narc_from(d.data, d.len)?;
+        defer n.close();
+        list_narc(&n);
+        return Ok<int, string>(0);
+    }
+    NdsRom rom = NdsRom_from(d.data, d.len)?;
+    defer rom.close();
+    if (prefix != null && rom.find(prefix) >= 0) {
+        Narc n = rom.narc(prefix)?;
+        defer n.close();
+        list_narc(&n);
+        return Ok<int, string>(0);
+    }
+    printf("%s (%s), %d files, %d overlays\n", rom.title, rom.code, rom.count(), rom.noverlays);
+    for (i in 0..rom.count()) {
+        string name = rom.name(i);
+        if (name == null) continue;
+        if (prefix != null && strncmp(name, prefix, strlen(prefix)) != 0) continue;
+        printf("%5d %10lld  %s\n", i, rom.file(i).len, name);
+    }
+    return Ok<int, string>(0);
+}
+
+if (argc < 2) {
+    printf("usage: narc_list FILE.narc | FILE.nds [PREFIX]\n");
+    return 1;
+}
+
+Result<int, string> r = run(argv[1], argc > 2 ? argv[2] : null);
+if (!r.ok) {
+    printf("error: %s\n", r.error);
+    return 1;
+}

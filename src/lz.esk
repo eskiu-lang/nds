@@ -1,0 +1,165 @@
+// lz.esk: the DS BIOS compressions and the backward LZ of ARM9 overlays.
+//
+//     Bytes b = nds_lz_decompress(data, len)?;   // LZ10 (0x10) or LZ11 (0x11)
+//     Bytes o = nds_blz_decompress(data, len)?;  // overlays, the ARM9 binary
+//
+// Every read and every back reference is checked, so corrupt data is an
+// error. Output is limited to 64 MB.
+
+import <mem>;
+import <bytes>;
+import <result>;
+
+const int64 NDS_LZ_LIMIT = 64 << 20;
+
+// True when the data starts like LZ10 or LZ11 data.
+bool nds_is_lz(*uint8 data, int64 len) {
+    return len >= 4 && (data[0] == 0x10 || data[0] == 0x11);
+}
+
+Result<Bytes, string> nds_lz_decompress(*uint8 d, int64 len) {
+    if (len < 4) return Err<Bytes, string>("lz: truncated");
+    int t = (int)d[0];
+    if (t != 0x10 && t != 0x11) return Err<Bytes, string>("lz: not LZ10 or LZ11 data");
+    int64 n = (int64)d[1] | ((int64)d[2] << 8) | ((int64)d[3] << 16);
+    int64 i = 4;
+    if (n == 0) {
+        if (len < 8) return Err<Bytes, string>("lz: truncated");
+        n = (int64)d[4] | ((int64)d[5] << 8) | ((int64)d[6] << 16) | ((int64)d[7] << 24);
+        i = 8;
+    }
+    if (n > NDS_LZ_LIMIT) return Err<Bytes, string>("lz: output too large");
+    let o: Bytes;
+    o.init(n + 1);
+    while (o.len < n) {
+        if (i >= len) {
+            o.free();
+            return Err<Bytes, string>("lz: truncated");
+        }
+        int f = (int)d[i];
+        i++;
+        for (b in 0..8) {
+            if (o.len >= n) break;
+            if ((f & (0x80 >> b)) == 0) {
+                if (i >= len) {
+                    o.free();
+                    return Err<Bytes, string>("lz: truncated");
+                }
+                o.push(d[i]);
+                i++;
+                continue;
+            }
+            int64 ln = 0;
+            int64 ds = 0;
+            if (t == 0x10) {
+                if (i + 2 > len) {
+                    o.free();
+                    return Err<Bytes, string>("lz: truncated");
+                }
+                int64 a = ((int64)d[i] << 8) | (int64)d[i + 1];
+                i += 2;
+                ln = (a >> 12) + 3;
+                ds = (a & 0xFFF) + 1;
+            } else {
+                if (i >= len) {
+                    o.free();
+                    return Err<Bytes, string>("lz: truncated");
+                }
+                int64 h = (int64)d[i] >> 4;
+                int64 need = h == 0 ? (int64)3 : (h == 1 ? (int64)4 : (int64)2);
+                if (i + need > len) {
+                    o.free();
+                    return Err<Bytes, string>("lz: truncated");
+                }
+                if (h == 0) {
+                    ln = ((((int64)d[i] & 15) << 4) | ((int64)d[i + 1] >> 4)) + 0x11;
+                    ds = ((((int64)d[i + 1] & 15) << 8) | (int64)d[i + 2]) + 1;
+                } else if (h == 1) {
+                    ln = ((((int64)d[i] & 15) << 12) | ((int64)d[i + 1] << 4) | ((int64)d[i + 2] >> 4)) + 0x111;
+                    ds = ((((int64)d[i + 2] & 15) << 8) | (int64)d[i + 3]) + 1;
+                } else {
+                    ln = h + 1;
+                    ds = ((((int64)d[i] & 15) << 8) | (int64)d[i + 1]) + 1;
+                }
+                i += need;
+            }
+            if (ds > o.len) {
+                o.free();
+                return Err<Bytes, string>("lz: reference before the start");
+            }
+            for (int64 k = 0; k < ln && o.len < n; k++) o.push(o.data[o.len - ds]);
+        }
+    }
+    return Ok<Bytes, string>(o);
+}
+
+// LZ data decompressed, anything else copied as it is.
+Result<Bytes, string> nds_unpack(*uint8 d, int64 len) {
+    if (nds_is_lz(d, len)) {
+        Result<Bytes, string> r = nds_lz_decompress(d, len);
+        if (r.ok) return r;
+    }
+    let o: Bytes;
+    o.init(len + 1);
+    o.append_raw(d, len);
+    return Ok<Bytes, string>(o);
+}
+
+// The backward LZ of overlays and the ARM9 binary: a footer at the end gives
+// the compressed span and how much the data grows; it decodes from the end
+// toward the start, in place.
+Result<Bytes, string> nds_blz_decompress(*uint8 d, int64 len) {
+    let o: Bytes;
+    if (len < 8) {
+        o.init(len + 1);
+        o.append_raw(d, len);
+        return Ok<Bytes, string>(o);
+    }
+    int64 enc_hdr = (int64)d[len - 8] | ((int64)d[len - 7] << 8) | ((int64)d[len - 6] << 16) | ((int64)d[len - 5] << 24);
+    int64 inc = (int64)d[len - 4] | ((int64)d[len - 3] << 8) | ((int64)d[len - 2] << 16) | ((int64)d[len - 1] << 24);
+    int64 hdr = enc_hdr >> 24;
+    int64 enc = enc_hdr & 0xFFFFFF;
+    if (hdr < 8 || hdr > len || enc > len || enc < hdr) return Err<Bytes, string>("blz: bad footer");
+    if (len + inc > NDS_LZ_LIMIT) return Err<Bytes, string>("blz: output too large");
+    o.init(len + inc + 1);
+    o.append_raw(d, len);
+    for (int64 k = 0; k < inc; k++) o.push(0);
+    int64 src = len - hdr;
+    int64 dst = o.len;
+    int64 stop = len - enc;
+    while (src > stop) {
+        src--;
+        int flags = (int)o.data[src];
+        for (b in 0..8) {
+            if (src <= stop) break;
+            if ((flags & 0x80) != 0) {
+                if (src - 2 < stop) {
+                    o.free();
+                    return Err<Bytes, string>("blz: truncated");
+                }
+                src -= 2;
+                int64 v = (int64)o.data[src] | ((int64)o.data[src + 1] << 8);
+                int64 disp = (v & 0xFFF) + 3;
+                int64 n = (v >> 12) + 3;
+                for (int64 k = 0; k < n; k++) {
+                    dst--;
+                    if (dst < 0 || dst + disp >= o.len) {
+                        o.free();
+                        return Err<Bytes, string>("blz: bad reference");
+                    }
+                    o.data[dst] = o.data[dst + disp];
+                }
+            } else {
+                src--;
+                dst--;
+                if (dst < 0) {
+                    o.free();
+                    return Err<Bytes, string>("blz: bad data");
+                }
+                o.data[dst] = o.data[src];
+            }
+            flags = flags << 1;
+        }
+    }
+    return Ok<Bytes, string>(o);
+}
