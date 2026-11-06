@@ -1,0 +1,6 @@
+# ssar ARCHIVE ENTRY OFFSET BANK VOL CPR PPR PLAYER (same as seq SEQ)
+ssar 0 0 5 0 100 64 64 1 seq 0
+ssar 0 1 29 0 90 32 16 2 seq 1
+strm 0 strm0.pcm 300 1 11025 1 40
+strm 1 strm1.pcm 612 2 22050 0 0
+strm 2 strm2.pcm 458 2 32728 1 100

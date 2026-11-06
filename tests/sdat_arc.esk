@@ -1,0 +1,115 @@
+// Sequence archives and streams: the SSAR of tools/gen_test_data.py, whose
+// sound effects are also stored as SSEQs (each entry must render exactly as
+// its SSEQ), SYMB names on two levels, and three STRMs against the PCM the
+// generator encoded.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <nds/bin>;
+import <nds/sdat>;
+import <nds/wav>;
+
+int fails = 0;
+
+void check(bool ok, string what) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+*uint8 slurp(string name, *int64 n) {
+    let p: Bytes;
+    p.init(64);
+    p.append_raw((*uint8)"tests/data/", 11);
+    p.append_raw((*uint8)name, strlen(name));
+    p.push(0);
+    *uint8 d = fs_read_all((string)p.data, n);
+    p.free();
+    return d;
+}
+
+Result<int, string> run() {
+    Sdat s = Sdat_open("tests/data/test_arc.sdat")?;
+    defer s.close();
+    check(s.ssar_count() == 1 && s.ssar_entries(0) == 3 && s.ssar_entries(1) == 0, "archive and entry counts");
+    check(s.ssar_find("SEQARC_SE") == 0 && strcmp(s.ssar_name(0), "SEQARC_SE") == 0 && s.ssar_name(1) == null, "archive names");
+    check(s.ssar_entry_find(0, "SE_B") == 1 && strcmp(s.ssar_entry_name(0, 0), "SE_A") == 0, "entry names");
+    check(s.ssar_entry_name(0, 2) == null && s.ssar_entry_find(0, "SE_C") == -1 && s.ssar_entry_find(1, "SE_A") == -1, "missing entry names");
+    SdatSsarEntry e = s.ssar_entry(0, 1)?;
+    check(e.offset == 29 && e.bank == 0 && e.vol == 90 && e.cpr == 32 && e.ppr == 16 && e.player == 2, "an entry's record");
+
+    // each entry renders as the SSEQ holding the same code
+    for (k in 0..2) {
+        Pcm16 a;
+        Pcm16 b;
+        int64 fa = s.render_ssar(0, k, 3.0, &a)?;
+        int64 fb = s.render(k, 3.0, &b)?;
+        check(fa == fb && fa > 4800, "the same length as the SSEQ");
+        check(fa == fb && memcmp((*void)a.data, (*void)b.data, fa * 4) == 0, "the same samples as the SSEQ");
+        int64 loud = 0;
+        for (int64 i = 0; i < fa * 2; i++) loud += a.data[i] < 0 ? -(int64)a.data[i] : (int64)a.data[i];
+        check(loud > 0, "an entry makes sound");
+        a.free();
+        b.free();
+    }
+    // a looping player goes on past the effect's jump back
+    SdatPlayer lp = SdatPlayer_open_ssar(&s, 0, 1, true)?;
+    *int16 buf = alloc<int16>(48000 * 2 * 2);
+    check(lp.render(buf, 48000 * 2) == 48000 * 2 && !lp.is_done(), "a looping effect");
+    free((*void)buf);
+    lp.free();
+
+    check(!SdatPlayer_open_ssar(&s, 0, 2, false).ok, "an entry outside the archive");
+    check(!SdatPlayer_open_ssar(&s, 0, 3, false).ok && !SdatPlayer_open_ssar(&s, 1, 0, false).ok && !SdatPlayer_open_ssar(&s, -1, 0, false).ok, "missing entries");
+    Pcm16 none;
+    check(!s.render_ssar(0, 9, 1.0, &none).ok && none.data == null, "render of a missing entry");
+
+    // streams
+    check(s.strm_count() == 3 && s.strm_find("STRM_ADPCM") == 2 && strcmp(s.strm_name(1), "STRM_PCM16") == 0, "stream names");
+    int[3] chans = {1, 2, 2};
+    int[3] rates = {11025, 22050, 32728};
+    int64[3] frames = {300, 612, 458};
+    bool[3] loops = {true, false, true};
+    int64[3] lstart = {40, 0, 100};
+    int[3] vols = {100, 127, 64};
+    for (k in 0..3) {
+        SdatStream st = s.stream(k)?;
+        check(st.kind == k && st.pcm.channels == chans[k] && st.pcm.rate == rates[k] && st.pcm.frames == frames[k], "stream header");
+        check(st.looped == loops[k] && st.loop_start == lstart[k] && st.vol == vols[k], "stream loop and volume");
+        int64 n = 0;
+        uint8[16] name;
+        sprintf(&name[0], "strm%d.pcm", k);
+        *uint8 ref = slurp((string)&name[0], &n);
+        bool same = ref != null && n == st.pcm.frames * (int64)st.pcm.channels * 2;
+        for (int64 i = 0; same && i < n / 2; i++) {
+            if ((int16)(uint16)((int)ref[i * 2] | ((int)ref[i * 2 + 1] << 8)) != st.pcm.data[i]) same = false;
+        }
+        check(same, "stream samples");
+        if (ref != null) free((*void)ref);
+        st.free();
+    }
+    check(!s.stream(3).ok && !s.stream(-1).ok, "missing streams");
+
+    // a stream cut short, and a wave archive is not a stream
+    NdsData f = s.file(7);
+    check(sdat_strm(f).ok && !sdat_strm(f.sub(0, f.len - 40)).ok && !sdat_strm(f.sub(0, 0x50)).ok, "a truncated stream");
+    check(!sdat_strm(s.file(1)).ok, "not a stream");
+
+    // the first SDAT has no archives or streams
+    Sdat old = Sdat_open("tests/data/test.sdat")?;
+    check(old.ssar_count() == 0 && old.strm_count() == 0 && old.ssar_entries(0) == 0, "an SDAT without them");
+    old.close();
+    return Ok<int, string>(0);
+}
+
+Result<int, string> r = run();
+if (!r.ok) {
+    printf("FAIL %s\n", r.error);
+    fails++;
+}
+
+if (fails > 0) return 1;
+printf("sdat_arc: ok\n");

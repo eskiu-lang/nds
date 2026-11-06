@@ -7,10 +7,13 @@
 //     defer pcm.free();
 //     pcm.write_wav("field.wav")?;
 //
-// An SDAT holds sequences (SSEQ, bytecode for the sound driver), instrument
-// banks (SBNK), wave archives (SWAR, PCM8, PCM16 or IMA-ADPCM samples) and
-// the SYMB names of each. The synthesizer is a port of the Tallgrass engine's
-// (engine/src/sdat.rs), which models the DS driver:
+// An SDAT holds sequences (SSEQ, bytecode for the sound driver), sequence
+// archives (SSAR, the sound effects: many sequences sharing one block of
+// bytecode, each with its own bank and volume), instrument banks (SBNK),
+// wave archives (SWAR, PCM8, PCM16 or IMA-ADPCM samples), streams (STRM,
+// long PCM or ADPCM waves in blocks) and the SYMB names of each. The
+// synthesizer is a port of the Tallgrass engine's (engine/src/sdat.rs),
+// which models the DS driver:
 //
 // - The driver runs at about 192 Hz (64 * 2728 cycles of 33.51 MHz). Each
 //   frame adds the tempo to an accumulator and runs one sequence tick for
@@ -71,6 +74,12 @@ struct _SdBankInfo {
     int[4] wa;
 }
 
+struct _SdStrmInfo {
+    bool present;
+    int file;
+    int vol;
+}
+
 struct Sdat {
     NdsData d;
     bool owned;
@@ -78,6 +87,10 @@ struct Sdat {
     *_SdFile files;
     int nseqs;
     *_SdSeqInfo seqs;
+    int nssars;
+    *int ssars;
+    int nstrms;
+    *_SdStrmInfo strms;
     int nbanks;
     *_SdBankInfo banks;
     int nwavearcs;
@@ -86,6 +99,12 @@ struct Sdat {
     *string seq_names;
     int nwavearc_names;
     *string wavearc_names;
+    int nssar_names;
+    *string ssar_names;
+    *int nssar_entry_names;
+    **string ssar_entry_names;
+    int nstrm_names;
+    *string strm_names;
 }
 
 // A decoded sample: mono 16-bit PCM, its rate, and the loop.
@@ -129,7 +148,13 @@ int _sd_records(NdsData* d, int64 info, int cat, *int64* out) {
 int _sd_names(NdsData* d, int64 symb, int cat, *string* out) {
     *out = null;
     if (symb == 0) return 0;
-    int64 r = d.u32(symb + 8 + (int64)cat * 4);
+    return _sd_names_at(d, symb, d.u32(symb + 8 + (int64)cat * 4), out);
+}
+
+// The SYMB names of the record at symb + r (a count, then an offset from
+// symb for each name).
+int _sd_names_at(NdsData* d, int64 symb, int64 r, *string* out) {
+    *out = null;
     if (r == 0) return 0;
     int64 n = d.u32(symb + r);
     int64 room = (d.len - (symb + r + 4)) / 4;
@@ -192,8 +217,22 @@ Result<Sdat, string> Sdat_from(*uint8 data, int64 len) {
     for (int64 i = 0; i < nf; i++) {
         s.files[i] = _SdFile{off: d.u32(fat + 12 + i * 16), len: d.u32(fat + 16 + i * 16)};
     }
+    n = _sd_records(d, info, 1, &rec);
+    s.nssars = n;
+    s.ssars = alloc<int>((int64)n + 1);
+    for (i in 0..n) s.ssars[i] = rec[i] == 0 ? -1 : d.u16(rec[i]);
+    if (rec != null) free((*void)rec);
+    n = _sd_records(d, info, 7, &rec);
+    s.nstrms = n;
+    s.strms = alloc<_SdStrmInfo>((int64)n + 1);
+    for (i in 0..n) {
+        if (rec[i] != 0) s.strms[i] = _SdStrmInfo{present: true, file: d.u16(rec[i]), vol: d.u8(rec[i] + 4)};
+    }
+    if (rec != null) free((*void)rec);
     s.nseq_names = _sd_names(d, symb, 0, &s.seq_names);
     s.nwavearc_names = _sd_names(d, symb, 3, &s.wavearc_names);
+    s.nstrm_names = _sd_names(d, symb, 7, &s.strm_names);
+    _sd_ssar_names(&s, symb);
     return Ok<Sdat, string>(s);
 }
 
@@ -219,9 +258,52 @@ void _sd_free_names(*string names, int n) {
     free((*void)names);
 }
 
+// The SEQARC names of SYMB have two levels: each archive's name, then a
+// record with the names of its sequences.
+void _sd_ssar_names(Sdat* s, int64 symb) {
+    if (symb == 0) return;
+    NdsData* d = &s.d;
+    int64 r = d.u32(symb + 8 + 4);
+    if (r == 0) return;
+    int64 n = d.u32(symb + r);
+    int64 room = (d.len - (symb + r + 4)) / 8;
+    if (room < 0) room = 0;
+    if (n > room) n = room;
+    if (n == 0) return;
+    s.nssar_names = (int)n;
+    s.ssar_names = alloc<string>(n);
+    s.nssar_entry_names = alloc<int>(n);
+    s.ssar_entry_names = alloc<*string>(n);
+    for (int64 i = 0; i < n; i++) {
+        int64 no = d.u32(symb + r + 4 + i * 8);
+        int64 sub = d.u32(symb + r + 8 + i * 8);
+        if (no != 0 && symb + no < d.len) s.ssar_names[i] = d.str(symb + no, d.len);
+        s.nssar_entry_names[i] = _sd_names_at(d, symb, sub, &s.ssar_entry_names[i]);
+    }
+}
+
 void Sdat_close(Sdat* self) {
     if (self.files != null) free((*void)self.files);
     if (self.seqs != null) free((*void)self.seqs);
+    if (self.ssars != null) free((*void)self.ssars);
+    if (self.strms != null) free((*void)self.strms);
+    _sd_free_names(self.ssar_names, self.nssar_names);
+    _sd_free_names(self.strm_names, self.nstrm_names);
+    if (self.ssar_entry_names != null) {
+        for (i in 0..self.nssar_names) _sd_free_names(self.ssar_entry_names[i], self.nssar_entry_names[i]);
+        free((*void)self.ssar_entry_names);
+        free((*void)self.nssar_entry_names);
+    }
+    self.ssars = null;
+    self.strms = null;
+    self.ssar_names = null;
+    self.strm_names = null;
+    self.ssar_entry_names = null;
+    self.nssar_entry_names = null;
+    self.nssars = 0;
+    self.nstrms = 0;
+    self.nssar_names = 0;
+    self.nstrm_names = 0;
     if (self.banks != null) free((*void)self.banks);
     if (self.wavearcs != null) free((*void)self.wavearcs);
     _sd_free_names(self.seq_names, self.nseq_names);
@@ -400,6 +482,112 @@ Result<SdatWave, string> Sdat_wave(Sdat* self, int wavearc, int index) {
     int f = _sd_wavearc_file(self, wavearc);
     if (f < 0) return Err<SdatWave, string>("sdat: no such wave archive");
     return sdat_swav(self.file(f), index);
+}
+
+// ---- streams (STRM) ----
+
+// A decoded stream: 16-bit PCM, channels interleaved (left first), at the
+// stream's rate; loop_start is in sample frames.
+struct SdatStream {
+    Pcm16 pcm;
+    int kind;
+    bool looped;
+    int64 loop_start;
+    int vol;
+}
+
+void SdatStream_free(SdatStream* self) {
+    self.pcm.free();
+}
+
+// Decodes a STRM file. Its HEAD block gives the format (0 PCM8, 1 PCM16, 2
+// IMA-ADPCM), the loop, the channels, the rate, the sample count and the
+// blocks: the DATA block holds block 0 of each channel, then block 1 of each
+// channel, and so on, the last one shorter. An ADPCM block starts with its
+// own header, as a SWAV's data does.
+Result<SdatStream, string> sdat_strm(NdsData f) {
+    if (!f.magic(0, "STRM")) return Err<SdatStream, string>("sdat: not a STRM");
+    if (!f.magic(0x10, "HEAD") || f.len < 0x60) return Err<SdatStream, string>("sdat: truncated STRM header");
+    int kind = f.u8(0x18);
+    int ch = f.u8(0x1A);
+    int rate = f.u16(0x1C);
+    int64 nsamples = f.u32(0x24);
+    int64 data = f.u32(0x28);
+    int64 nblocks = f.u32(0x2C);
+    int64 blen = f.u32(0x30);
+    int64 bsamples = f.u32(0x34);
+    int64 lastlen = f.u32(0x38);
+    int64 lastsamples = f.u32(0x3C);
+    if (kind > 2) return Err<SdatStream, string>("sdat: unknown STRM wave format");
+    if (ch < 1 || ch > 16) return Err<SdatStream, string>("sdat: bad STRM channel count");
+    if (nblocks < 1 || blen < 0 || lastlen < 0 || bsamples < 0 || lastsamples < 0) return Err<SdatStream, string>("sdat: bad STRM blocks");
+    // every block of every channel must be inside the file
+    int64 full = nblocks - 1;
+    if (full > 0 && blen > (f.len - data) / full / (int64)ch) return Err<SdatStream, string>("sdat: STRM blocks out of range");
+    if (!f.has(data, full * blen * (int64)ch + lastlen * (int64)ch)) return Err<SdatStream, string>("sdat: STRM blocks out of range");
+    // no block holds more samples than its bytes can encode
+    int64 most = kind == 0 ? blen : (kind == 1 ? blen / 2 : (blen > 4 ? (blen - 4) * 2 : (int64)0));
+    int64 most_last = kind == 0 ? lastlen : (kind == 1 ? lastlen / 2 : (lastlen > 4 ? (lastlen - 4) * 2 : (int64)0));
+    if (bsamples > most) bsamples = most;
+    if (lastsamples > most_last) lastsamples = most_last;
+    int64 per = full * bsamples + lastsamples;
+    if (nsamples < per) per = nsamples;
+    let s: SdatStream;
+    s.kind = kind;
+    s.looped = f.u8(0x19) != 0;
+    s.loop_start = f.u32(0x20);
+    s.vol = 127;
+    s.pcm = Pcm16{data: alloc<int16>(per * (int64)ch + 1), frames: per, channels: ch, rate: rate < 1 ? 1 : rate};
+    int64 maxlen = blen > lastlen ? blen : lastlen;
+    *int16 tmp = alloc<int16>(maxlen * 2 + 2);
+    defer free((*void)tmp);
+    for (c in 0..ch) {
+        int64 at = 0;
+        for (int64 b = 0; b < nblocks && at < per; b++) {
+            bool last = b == nblocks - 1;
+            int64 len = last ? lastlen : blen;
+            int64 want = last ? lastsamples : bsamples;
+            NdsData blk = f.sub(data + b * blen * (int64)ch + (int64)c * len, len);
+            int64 got = 0;
+            if (kind == 0) {
+                for (int64 i = 0; i < blk.len; i++) tmp[i] = (int16)((int)(int8)blk.data[i] << 8);
+                got = blk.len;
+            } else if (kind == 1) {
+                for (int64 i = 0; i < blk.len / 2; i++) tmp[i] = (int16)blk.s16(i * 2);
+                got = blk.len / 2;
+            } else {
+                got = _sd_adpcm(blk, tmp);
+            }
+            if (got > want) got = want;
+            if (got > per - at) got = per - at;
+            for (int64 i = 0; i < got; i++) s.pcm.data[(at + i) * (int64)ch + (int64)c] = tmp[i];
+            at += got;
+        }
+    }
+    if (s.loop_start > per) s.loop_start = per;
+    return Ok<SdatStream, string>(s);
+}
+
+// Stream slots in the INFO block (some may be empty).
+int Sdat_strm_count(Sdat* self) {
+    return self.nstrms;
+}
+
+string Sdat_strm_name(Sdat* self, int i) {
+    if (i < 0 || i >= self.nstrm_names) return null;
+    return self.strm_names[i];
+}
+
+int Sdat_strm_find(Sdat* self, string name) {
+    return _sd_find(self.strm_names, self.nstrm_names, name);
+}
+
+// Stream i decoded, with the volume of its INFO record.
+Result<SdatStream, string> Sdat_stream(Sdat* self, int i) {
+    if (i < 0 || i >= self.nstrms || !self.strms[i].present) return Err<SdatStream, string>("sdat: no such stream");
+    SdatStream s = sdat_strm(self.file(self.strms[i].file))?;
+    s.vol = self.strms[i].vol;
+    return Ok<SdatStream, string>(s);
 }
 
 // ---- banks (SBNK) ----
@@ -674,10 +862,16 @@ Result<SdatPlayer, string> SdatPlayer_open(Sdat* sdat, int i, bool looping) {
     _SdSeqInfo info = sdat.seqs[i];
     NdsData f = sdat.file(info.file);
     if (!f.magic(0, "SSEQ")) return Err<SdatPlayer, string>("sdat: sequence is not an SSEQ");
-    if (info.bank < 0 || info.bank >= sdat.nbanks || !sdat.banks[info.bank].present) {
+    return _sd_player(sdat, f, 0, info.bank, info.vol, looping);
+}
+
+// A player over the bytecode of file f (an SSEQ or an SSAR, its data offset
+// at 0x18) starting start bytes into the data.
+Result<SdatPlayer, string> _sd_player(Sdat* sdat, NdsData f, int64 start, int bank_id, int vol, bool looping) {
+    if (bank_id < 0 || bank_id >= sdat.nbanks || !sdat.banks[bank_id].present) {
         return Err<SdatPlayer, string>("sdat: the sequence's bank is missing");
     }
-    Result<_SdBank, string> bank = _sd_load_bank(sdat, sdat.banks[info.bank]);
+    Result<_SdBank, string> bank = _sd_load_bank(sdat, sdat.banks[bank_id]);
     if (!bank.ok) return Err<SdatPlayer, string>(bank.error);
     let p: SdatPlayer;
     p.seq = alloc<uint8>(f.len + 1);
@@ -685,7 +879,7 @@ Result<SdatPlayer, string> SdatPlayer_open(Sdat* sdat, int i, bool looping) {
     p.seq_len = f.len;
     p.base = f.u32(0x18);
     p.bank = bank.value;
-    p.seq_vol = info.vol;
+    p.seq_vol = vol;
     p.master_vol = 127;
     p.tempo = 120;
     p.cond = true;
@@ -697,7 +891,7 @@ Result<SdatPlayer, string> SdatPlayer_open(Sdat* sdat, int i, bool looping) {
     for (k in 0..128) p.sine[k] = (int)round(127.0 * sin(6.283185307179586 * (double)k / 128.0));
     int loops = looping ? -1 : 0;
     p.tracks.init(16);
-    int64 pc = p.base;
+    int64 pc = p.base + start;
     if (_sd_seq_byte(p.seq, p.seq_len, pc) == 0xFE) pc += 3;
     List<int64> starts;
     starts.init(16);
@@ -719,6 +913,88 @@ Result<SdatPlayer, string> SdatPlayer_open_name(Sdat* sdat, string name, bool lo
     int i = sdat.seq_find(name);
     if (i < 0) return Err<SdatPlayer, string>("sdat: no sequence with that name");
     return SdatPlayer_open(sdat, i, looping);
+}
+
+// ---- sequence archives (SSAR) ----
+
+// One sequence of an SSAR: where it starts in the archive's bytecode and
+// its settings (bank, volume, channel and polyphonic priority, player).
+struct SdatSsarEntry {
+    int64 offset;
+    int bank;
+    int vol;
+    int cpr;
+    int ppr;
+    int player;
+}
+
+// Sequence archive slots in the INFO block (some may be empty).
+int Sdat_ssar_count(Sdat* self) {
+    return self.nssars;
+}
+
+// The SYMB name of sequence archive i, or null.
+string Sdat_ssar_name(Sdat* self, int i) {
+    if (i < 0 || i >= self.nssar_names) return null;
+    return self.ssar_names[i];
+}
+
+int Sdat_ssar_find(Sdat* self, string name) {
+    return _sd_find(self.ssar_names, self.nssar_names, name);
+}
+
+// The SSAR file of archive i: an empty view when there is none.
+NdsData _sd_ssar_file(Sdat* self, int i) {
+    if (i < 0 || i >= self.nssars || self.ssars[i] < 0) return NdsData{data: null, len: 0};
+    NdsData f = self.file(self.ssars[i]);
+    if (!f.magic(0, "SSAR")) return NdsData{data: null, len: 0};
+    return f;
+}
+
+// The number of sequences in archive i (0 when it is missing).
+int Sdat_ssar_entries(Sdat* self, int i) {
+    NdsData f = _sd_ssar_file(self, i);
+    int64 n = f.u32(0x1C);
+    int64 room = f.len > 0x20 ? (f.len - 0x20) / 12 : (int64)0;
+    return (int)(n > room ? room : n);
+}
+
+// The SYMB name of sequence k of archive i, or null.
+string Sdat_ssar_entry_name(Sdat* self, int i, int k) {
+    if (i < 0 || i >= self.nssar_names || k < 0 || k >= self.nssar_entry_names[i]) return null;
+    return self.ssar_entry_names[i][k];
+}
+
+// The index of the sequence named name in archive i, or -1.
+int Sdat_ssar_entry_find(Sdat* self, int i, string name) {
+    if (i < 0 || i >= self.nssar_names) return -1;
+    return _sd_find(self.ssar_entry_names[i], self.nssar_entry_names[i], name);
+}
+
+// Sequence k of archive i: the 12-byte record after the DATA block's data
+// offset and count.
+Result<SdatSsarEntry, string> Sdat_ssar_entry(Sdat* self, int i, int k) {
+    NdsData f = _sd_ssar_file(self, i);
+    if (f.data == null) return Err<SdatSsarEntry, string>("sdat: no such sequence archive");
+    if (k < 0 || k >= self.ssar_entries(i)) return Err<SdatSsarEntry, string>("sdat: no such sequence in the archive");
+    int64 r = 0x20 + (int64)k * 12;
+    let e: SdatSsarEntry;
+    e.offset = f.u32(r);
+    e.bank = f.u16(r + 4);
+    e.vol = f.u8(r + 6);
+    e.cpr = f.u8(r + 7);
+    e.ppr = f.u8(r + 8);
+    e.player = f.u8(r + 9);
+    return Ok<SdatSsarEntry, string>(e);
+}
+
+// Opens sequence k of archive i (a sound effect) with its bank and volume.
+// It may jump and call into the rest of the archive's bytecode.
+Result<SdatPlayer, string> SdatPlayer_open_ssar(Sdat* sdat, int i, int k, bool looping) {
+    SdatSsarEntry e = sdat.ssar_entry(i, k)?;
+    NdsData f = _sd_ssar_file(sdat, i);
+    if (f.u32(0x18) + e.offset >= f.len) return Err<SdatPlayer, string>("sdat: the sequence is outside the archive");
+    return _sd_player(sdat, f, e.offset, e.bank, e.vol, looping);
 }
 
 void SdatPlayer_free(SdatPlayer* self) {
@@ -1314,4 +1590,19 @@ Result<int64, string> Sdat_render_name(Sdat* self, string name, double seconds, 
         return Err<int64, string>("sdat: no sequence with that name");
     }
     return Sdat_render(self, i, seconds, out);
+}
+
+// Renders seconds of sequence k of archive i (a sound effect, not looping)
+// into out, 48 kHz stereo. Returns the frame count.
+Result<int64, string> Sdat_render_ssar(Sdat* self, int i, int k, double seconds, Pcm16* out) {
+    *out = Pcm16{data: null, frames: 0, channels: 2, rate: SDAT_RATE};
+    Result<SdatPlayer, string> r = SdatPlayer_open_ssar(self, i, k, false);
+    if (!r.ok) return Err<int64, string>(r.error);
+    SdatPlayer p = r.value;
+    int64 frames = (int64)(48000.0 * seconds);
+    if (frames < 0) frames = 0;
+    out.data = alloc<int16>(frames * 2 + 2);
+    out.frames = p.render(out.data, frames);
+    p.free();
+    return Ok<int64, string>(out.frames);
 }

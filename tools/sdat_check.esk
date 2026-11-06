@@ -1,0 +1,74 @@
+// Decodes every SSAR sound effect and STRM stream of an SDAT inside a ROM:
+//
+//     sdat_check ROM.nds SDAT_PATH [WAV_DIR]
+//
+// Each sequence archive entry is opened and rendered for 2 seconds, each
+// stream decoded (and written as WAV_DIR/strm_N.wav when a directory is
+// given). Prints a line per stream and the totals; exits 1 on an error.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <nds/bin>;
+import <nds/rom>;
+import <nds/sdat>;
+import <nds/wav>;
+
+Result<int, string> run(int n, *string a) {
+    NdsRom rom = NdsRom_open(a[1])?;
+    defer rom.close();
+    NdsData f = rom.file_path(a[2]);
+    if (f.data == null) return Err<int, string>("no such file in the ROM");
+    Sdat s = Sdat_from(f.data, f.len)?;
+    defer s.close();
+    int bad = 0;
+    int entries = 0;
+    int64 frames = 0;
+    for (i in 0..s.ssar_count()) {
+        for (k in 0..s.ssar_entries(i)) {
+            Pcm16 pcm;
+            Result<int64, string> r = s.render_ssar(i, k, 2.0, &pcm);
+            if (r.ok) {
+                entries++;
+                frames += r.value;
+                pcm.free();
+            } else {
+                printf("ssar %d entry %d: %s\n", i, k, r.error);
+                bad++;
+            }
+        }
+    }
+    int streams = 0;
+    for (i in 0..s.strm_count()) {
+        Result<SdatStream, string> r = s.stream(i);
+        if (!r.ok) {
+            if (s.strms[i].present) {
+                printf("strm %d: %s\n", i, r.error);
+                bad++;
+            }
+            continue;
+        }
+        SdatStream st = r.value;
+        printf("strm %d %s: format %d, %d channels, %d Hz, %lld frames, loop %d from %lld\n", i, s.strm_name(i) == null ? "-" : s.strm_name(i), st.kind, st.pcm.channels, st.pcm.rate, st.pcm.frames, st.looped ? 1 : 0, st.loop_start);
+        if (n > 3) {
+            uint8[512] path;
+            sprintf(&path[0], "%s/strm_%d.wav", a[3], i);
+            st.pcm.write_wav((string)&path[0])?;
+        }
+        streams++;
+        st.free();
+    }
+    printf("%d sound effects (%lld frames rendered), %d streams, %d errors\n", entries, frames, streams, bad);
+    return Ok<int, string>(bad);
+}
+
+if (argc < 3) {
+    printf("usage: sdat_check ROM.nds SDAT_PATH [WAV_DIR]\n");
+    return 1;
+}
+Result<int, string> r = run(argc, argv);
+if (!r.ok) {
+    printf("error: %s\n", r.error);
+    return 1;
+}
+return r.value > 0 ? 1 : 0;
