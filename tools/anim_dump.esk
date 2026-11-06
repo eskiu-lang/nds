@@ -1,0 +1,100 @@
+// Prints the sequences of NANR / NMAR files and the nodes of NMCR files for
+// tools/compare_anims.py, and renders their frames:
+//
+//     anim_dump nanr FILE                    (one line per sequence, then frames)
+//     anim_dump nmcr FILE                    (one line per node)
+//     anim_dump render NANR NCER NCGR NCLR   (draws every frame, prints a sum)
+//
+// Each input may be LZ-compressed.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <list>;
+import <nds/bin>;
+import <nds/lz>;
+import <nds/image>;
+import <nds/graphics>;
+
+Result<Bytes, string> load(string path) {
+    NdsData d = nds_read_file(path)?;
+    Result<Bytes, string> b = nds_unpack(d.data, d.len);
+    free((*void)d.data);
+    return b;
+}
+
+Result<int, string> run(int n, *string a) {
+    if (strcmp(a[1], "nanr") == 0) {
+        Bytes b = load(a[2])?;
+        defer b.free();
+        NdsAnims an = nanr_read(b.data, b.len)?;
+        defer an.free();
+        for (i in 0..an.count) {
+            NdsAnimSeq* s = &an.seqs[i];
+            printf("seq %d %d %d %d %d\n", i, s.kind, s.cell_type, s.loop, s.count);
+            for (k in 0..s.count) {
+                NdsAnimFrame* f = an.frame(i, k);
+                printf("%d %d %d %d %d %d %d\n", f.duration, f.cell, f.rotate, f.scale_x, f.scale_y, f.x, f.y);
+            }
+        }
+    } else if (strcmp(a[1], "nmcr") == 0) {
+        Bytes b = load(a[2])?;
+        defer b.free();
+        NdsMultiCells mc = nmcr_read(b.data, b.len)?;
+        defer mc.free();
+        for (i in 0..mc.count) {
+            printf("mc %d %d %d\n", i, mc.n[i], mc.nanims[i]);
+            for (k in 0..mc.n[i]) {
+                NdsMcNode* nd = mc.node(i, k);
+                printf("%d %d %d %d %d\n", nd.seq, nd.x, nd.y, nd.mode, nd.anim);
+            }
+        }
+    } else if (strcmp(a[1], "render") == 0 && n > 5) {
+        Bytes b = load(a[2])?;
+        defer b.free();
+        Bytes c = load(a[3])?;
+        defer c.free();
+        Bytes g = load(a[4])?;
+        defer g.free();
+        Bytes p = load(a[5])?;
+        defer p.free();
+        NdsAnims an = nanr_read(b.data, b.len)?;
+        defer an.free();
+        NdsCells cells = ncer_read(c.data, c.len)?;
+        defer cells.free();
+        NdsTiles t = ncgr_read(g.data, g.len)?;
+        defer t.free();
+        NdsPalette pal = nclr_read(p.data, p.len)?;
+        defer pal.free();
+        int64 sum = 0;
+        int frames = 0;
+        for (i in 0..an.count) {
+            List<NdsImage> imgs;
+            imgs.init(8);
+            an.render(i, &cells, &t, &pal, &imgs);
+            for (k in 0..imgs.size) {
+                NdsImage* im = &imgs.data[k];
+                for (int64 q = 0; q < (int64)im.width * (int64)im.height * 4; q++) sum = (sum * 31 + (int64)im.rgba[q]) & 0xFFFFFFFF;
+                im.free();
+                frames++;
+            }
+            imgs.free();
+        }
+        printf("%d frames %lld\n", frames, sum);
+    } else {
+        return Err<int, string>("unknown command");
+    }
+    return Ok<int, string>(0);
+}
+
+if (argc < 3) {
+    printf("usage: anim_dump nanr|nmcr|render FILES...\n");
+    return 1;
+}
+
+Result<int, string> r = run(argc, argv);
+if (!r.ok) {
+    printf("error: %s\n", r.error);
+    return 1;
+}

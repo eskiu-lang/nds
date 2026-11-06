@@ -12,17 +12,26 @@
 // - NCER cells: groups of OAM objects (sprites) placed around an origin,
 //   drawn with 1D or 2D tile mapping, or over a linear bitmap atlas as the
 //   multi-cell sprites of later games use. Affine objects are drawn
-//   without their rotation (NANR animations carry it, see <nds/mcss>).
+//   without their rotation (NANR animations carry it).
+// - NANR (and NMAR) cell animations: sequences of frames, each a cell (or a
+//   multi-cell) shown for a number of 60 Hz ticks, with an optional
+//   translation or rotation and scale. NdsCells_draw_frame draws a frame.
+// - NMCR multi-cells: cells placed around an origin, each playing a
+//   sequence of a NANR.
 //
 // Colors are converted as the extraction tools do: each 5-bit channel times
 // 255 / 31, rounded down. Color index 0 of a palette is transparent where
 // the hardware treats it so (screens drawn with transparent0, cells).
 
 import <mem>;
+import <math>;
 import <list>;
 import <result>;
 import <nds/bin>;
 import <nds/image>;
+
+extern double sin(double x);
+extern double cos(double x);
 
 // Finds a block by its magic in a Nitro file (after the header). Returns its
 // offset, or -1.
@@ -429,4 +438,427 @@ NdsImage NdsCells_render(NdsCells* self, int cell, NdsTiles* tiles, NdsPalette* 
     NdsImage img = NdsImage_new(x1 - x0, y1 - y0);
     self.draw(cell, tiles, pal, &img, -x0, -y0);
     return img;
+}
+
+// ---- cell animations (NANR, NMAR) ----
+
+// Frame kinds of a sequence, from its ABNK record.
+const int NDS_ANIM_INDEX = 0;
+const int NDS_ANIM_SRT = 1;
+const int NDS_ANIM_TRANSLATE = 2;
+
+// One frame: cell (an NCER cell, or a multi-cell for an NMAR) shown for
+// duration ticks of 60 Hz. rotate is a turn in 65536 steps, scale_x and
+// scale_y are fixed point with 12 fraction bits (4096 is 1.0), x and y move
+// the cell's origin. Frames without a transform have rotate 0, scale 4096
+// and x, y 0.
+struct NdsAnimFrame {
+    int cell;
+    int duration;
+    int rotate;
+    int scale_x;
+    int scale_y;
+    int x;
+    int y;
+}
+
+// A sequence: kind (NDS_ANIM_*), cell_type (1 cells, 2 multi-cells), loop
+// (1 stop at the end, 2 repeat, 3 forward then back once, 4 back and forth
+// forever; anything else stops) and its frames in NdsAnims.frames.
+struct NdsAnimSeq {
+    int kind;
+    int cell_type;
+    int loop;
+    int first;
+    int count;
+}
+
+struct NdsAnims {
+    int count;
+    *NdsAnimSeq seqs;
+    List<NdsAnimFrame> frames;
+}
+
+void NdsAnims_free(NdsAnims* self) {
+    if (self.seqs != null) free((*void)self.seqs);
+    if (self.frames.data != null) List_free<NdsAnimFrame>(&self.frames);
+    self.seqs = null;
+    self.count = 0;
+}
+
+// An NANR (RNAN) or NMAR (RAMN) file: the ABNK block's sequences and their
+// frames. A frame's transform record is 2 bytes (cell only), 16 (cell,
+// rotation, two scales, translation) or 8 (cell, translation) by the
+// sequence's kind.
+Result<NdsAnims, string> nanr_read(*uint8 data, int64 len) {
+    NdsData d = NdsData{data: data, len: len};
+    if (!d.magic(0, "RNAN") && !d.magic(0, "RAMN")) return Err<NdsAnims, string>("nanr: not an NANR or NMAR file");
+    int64 sec = nds_section(&d, "KNBA");
+    if (sec < 0) return Err<NdsAnims, string>("nanr: no ABNK block");
+    int64 s = sec + 8;
+    if (!d.has(s, 20)) return Err<NdsAnims, string>("nanr: truncated ABNK block");
+    int n = d.u16(s);
+    int64 seqs = s + d.u32(s + 4);
+    int64 frames = s + d.u32(s + 8);
+    int64 props = s + d.u32(s + 12);
+    if (!d.has(seqs, (int64)n * 16)) return Err<NdsAnims, string>("nanr: sequences out of range");
+    let a: NdsAnims;
+    a.count = n;
+    a.seqs = alloc<NdsAnimSeq>((int64)n + 1);
+    a.frames.init(16);
+    for (i in 0..n) {
+        int64 q = seqs + (int64)i * 16;
+        int64 cnt = d.u32(q);
+        NdsAnimSeq* sq = &a.seqs[i];
+        sq.kind = d.u16(q + 4);
+        sq.cell_type = d.u16(q + 6);
+        sq.loop = (int)d.u32(q + 8);
+        int64 fo = frames + d.u32(q + 12);
+        if (!d.has(fo, cnt * 8)) {
+            NdsAnims_free(&a);
+            return Err<NdsAnims, string>("nanr: frames out of range");
+        }
+        int64 psize = sq.kind == NDS_ANIM_SRT ? (int64)16 : (sq.kind == NDS_ANIM_TRANSLATE ? (int64)8 : (int64)2);
+        sq.first = a.frames.size;
+        sq.count = (int)cnt;
+        for (int64 k = 0; k < cnt; k++) {
+            int64 p = props + d.u32(fo + k * 8);
+            if (!d.has(p, psize)) {
+                NdsAnims_free(&a);
+                return Err<NdsAnims, string>("nanr: frame data out of range");
+            }
+            NdsAnimFrame f = NdsAnimFrame{cell: d.u16(p), duration: d.u16(fo + k * 8 + 4), rotate: 0, scale_x: 4096, scale_y: 4096, x: 0, y: 0};
+            if (sq.kind == NDS_ANIM_SRT) {
+                f.rotate = d.u16(p + 2);
+                f.scale_x = d.s32(p + 4);
+                f.scale_y = d.s32(p + 8);
+                f.x = d.s16(p + 12);
+                f.y = d.s16(p + 14);
+            } else if (sq.kind == NDS_ANIM_TRANSLATE) {
+                f.x = d.s16(p + 4);
+                f.y = d.s16(p + 6);
+            }
+            a.frames.push(f);
+        }
+    }
+    return Ok<NdsAnims, string>(a);
+}
+
+// Frame k of sequence seq, or null.
+NdsAnimFrame* NdsAnims_frame(NdsAnims* self, int seq, int k) {
+    if (seq < 0 || seq >= self.count || k < 0 || k >= self.seqs[seq].count) return null;
+    return &self.frames.data[self.seqs[seq].first + k];
+}
+
+// The number of frames of sequence seq.
+int NdsAnims_frames(NdsAnims* self, int seq) {
+    if (seq < 0 || seq >= self.count) return 0;
+    return self.seqs[seq].count;
+}
+
+// The ticks of one pass through sequence seq.
+int64 NdsAnims_duration(NdsAnims* self, int seq) {
+    int64 t = 0;
+    for (k in 0..self.frames(seq)) t += (int64)self.frame(seq, k).duration;
+    return t;
+}
+
+// The frame of sequence seq shown tick ticks after it starts, by its loop
+// mode; -1 when it has no frames. Going back, the turning frames are shown
+// once each (0 1 2 1 0 1 2 ...).
+int NdsAnims_frame_at(NdsAnims* self, int seq, int64 tick) {
+    int n = self.frames(seq);
+    if (n == 0) return -1;
+    if (tick < 0) tick = 0;
+    int loop = self.seqs[seq].loop;
+    bool back = loop == 3 || loop == 4;
+    // the pass as a list of frame indices: forward, then back without the ends
+    int steps = back && n > 1 ? n * 2 - 2 : n;
+    int64 total = 0;
+    for (k in 0..steps) total += (int64)self.frame(seq, k < n ? k : steps - k).duration;
+    if (total <= 0) return 0;
+    if (loop == 2 || loop == 4) {
+        tick = tick % total;
+    } else if (tick >= total) {
+        return back ? 0 : n - 1;
+    }
+    for (k in 0..steps) {
+        int f = k < n ? k : steps - k;
+        int64 dur = (int64)self.frame(seq, f).duration;
+        if (tick < dur) return f;
+        tick -= dur;
+    }
+    return back ? 0 : n - 1;
+}
+
+// The 2x2 matrix that takes a point of the drawn frame back to the cell, as
+// the hardware's rotation and scaling parameters (GBATEK, OBJ rotation):
+// a = cos / sx, b = sin / sx, c = -sin / sy, d = cos / sy. False when a
+// scale is 0.
+bool _g2d_inverse(NdsAnimFrame* f, *double m) {
+    if (f.scale_x == 0 || f.scale_y == 0) return false;
+    double ang = (double)f.rotate * 6.283185307179586 / 65536.0;
+    double sx = (double)f.scale_x / 4096.0;
+    double sy = (double)f.scale_y / 4096.0;
+    double cs = cos(ang);
+    double sn = sin(ang);
+    m[0] = cs / sx;
+    m[1] = sn / sx;
+    m[2] = -sn / sy;
+    m[3] = cs / sy;
+    return true;
+}
+
+bool _g2d_identity(NdsAnimFrame* f) {
+    return f.rotate == 0 && f.scale_x == 4096 && f.scale_y == 4096;
+}
+
+// Frame boxes are kept within 1024 pixels of the origin (four times the
+// screen), so a corrupt scale or translation cannot ask for a huge image.
+int _g2d_clamp(int v) {
+    return v < -1024 ? -1024 : (v > 1024 ? 1024 : v);
+}
+
+int _g2d_clampd(double v) {
+    return v < -1024.0 ? -1024 : (v > 1024.0 ? 1024 : (int)v);
+}
+
+// The box of frame f around the cell's origin, after its transform (within
+// 1024 pixels of it).
+void NdsCells_frame_bounds(NdsCells* self, NdsAnimFrame* f, *int x0, *int y0, *int x1, *int y1) {
+    int bx0 = 0;
+    int by0 = 0;
+    int bx1 = 0;
+    int by1 = 0;
+    self.bounds(f.cell, &bx0, &by0, &bx1, &by1);
+    if (!_g2d_identity(f)) {
+        double[4] m;
+        if (!_g2d_inverse(f, &m[0]) || bx1 <= bx0 || by1 <= by0) {
+            bx0 = 0;
+            by0 = 0;
+            bx1 = 0;
+            by1 = 0;
+        } else {
+            // the forward matrix is the inverse of m
+            double det = m[0] * m[3] - m[1] * m[2];
+            double fa = m[3] / det;
+            double fb = -m[1] / det;
+            double fc = -m[2] / det;
+            double fd = m[0] / det;
+            double lx = 1e9;
+            double ly = 1e9;
+            double hx = -1e9;
+            double hy = -1e9;
+            for (k in 0..4) {
+                double px = (double)((k & 1) == 0 ? bx0 : bx1);
+                double py = (double)((k & 2) == 0 ? by0 : by1);
+                double qx = fa * px + fb * py;
+                double qy = fc * px + fd * py;
+                if (qx < lx) lx = qx;
+                if (qy < ly) ly = qy;
+                if (qx > hx) hx = qx;
+                if (qy > hy) hy = qy;
+            }
+            bx0 = _g2d_clampd(floor(lx));
+            by0 = _g2d_clampd(floor(ly));
+            bx1 = -_g2d_clampd(floor(-hx));
+            by1 = -_g2d_clampd(floor(-hy));
+        }
+    }
+    *x0 = _g2d_clamp(bx0 + f.x);
+    *y0 = _g2d_clamp(by0 + f.y);
+    *x1 = _g2d_clamp(bx1 + f.x);
+    *y1 = _g2d_clamp(by1 + f.y);
+}
+
+// Draws frame f onto dst with the cell's origin at (ox, oy): the cell moved
+// by the frame's translation and, for a rotation or scale, turned and
+// scaled around its origin (each drawn pixel samples the cell at its
+// center, nearest neighbor). An identity transform draws exactly as
+// NdsCells_draw.
+void NdsCells_draw_frame(NdsCells* self, NdsAnimFrame* f, NdsTiles* tiles, NdsPalette* pal, NdsImage* dst, int ox, int oy) {
+    if (f == null || f.cell < 0 || f.cell >= self.count) return;
+    if (_g2d_identity(f)) {
+        self.draw(f.cell, tiles, pal, dst, ox + f.x, oy + f.y);
+        return;
+    }
+    double[4] m;
+    if (!_g2d_inverse(f, &m[0])) return;
+    int cx0 = 0;
+    int cy0 = 0;
+    int cx1 = 0;
+    int cy1 = 0;
+    self.bounds(f.cell, &cx0, &cy0, &cx1, &cy1);
+    NdsImage src = NdsImage_new(cx1 - cx0, cy1 - cy0);
+    defer src.free();
+    self.draw(f.cell, tiles, pal, &src, -cx0, -cy0);
+    int x0 = 0;
+    int y0 = 0;
+    int x1 = 0;
+    int y1 = 0;
+    self.frame_bounds(f, &x0, &y0, &x1, &y1);
+    for (y in y0..y1) {
+        for (x in x0..x1) {
+            double dx = (double)(x - f.x) + 0.5;
+            double dy = (double)(y - f.y) + 0.5;
+            int sx = (int)floor(m[0] * dx + m[1] * dy) - cx0;
+            int sy = (int)floor(m[2] * dx + m[3] * dy) - cy0;
+            uint32 c = src.get(sx, sy);
+            if ((c >> 24) == 0) continue;
+            dst.set(ox + x, oy + y, (int)(c & 0xFF), (int)((c >> 8) & 0xFF), (int)((c >> 16) & 0xFF), 255);
+        }
+    }
+}
+
+// Every frame of cell sequence seq as an image, all on the same canvas (the
+// box of every frame, so the origin stays put), appended to out. Returns
+// the number of frames.
+int NdsAnims_render(NdsAnims* self, int seq, NdsCells* cells, NdsTiles* tiles, NdsPalette* pal, List<NdsImage>* out) {
+    int n = self.frames(seq);
+    int x0 = 0;
+    int y0 = 0;
+    int x1 = 0;
+    int y1 = 0;
+    for (k in 0..n) {
+        int a0 = 0;
+        int b0 = 0;
+        int a1 = 0;
+        int b1 = 0;
+        cells.frame_bounds(self.frame(seq, k), &a0, &b0, &a1, &b1);
+        if (k == 0 || a0 < x0) x0 = a0;
+        if (k == 0 || b0 < y0) y0 = b0;
+        if (k == 0 || a1 > x1) x1 = a1;
+        if (k == 0 || b1 > y1) y1 = b1;
+    }
+    for (k in 0..n) {
+        NdsImage img = NdsImage_new(x1 - x0, y1 - y0);
+        cells.draw_frame(self.frame(seq, k), tiles, pal, &img, -x0, -y0);
+        out.push(img);
+    }
+    return n;
+}
+
+// ---- multi-cells (NMCR) ----
+
+// One cell of a multi-cell: it plays sequence seq of the cells' NANR with
+// its origin at (x, y). mode is the record's play flags (0x20 restarts the
+// sequence when the multi-cell is shown again, 0x21 keeps its time) and
+// anim the animation slot it plays in (nodes may share one).
+struct NdsMcNode {
+    int seq;
+    int x;
+    int y;
+    int mode;
+    int anim;
+}
+
+struct NdsMultiCells {
+    int count;
+    *int first;
+    *int n;
+    *int nanims;
+    List<NdsMcNode> nodes;
+}
+
+void NdsMultiCells_free(NdsMultiCells* self) {
+    if (self.first != null) free((*void)self.first);
+    if (self.n != null) free((*void)self.n);
+    if (self.nanims != null) free((*void)self.nanims);
+    if (self.nodes.data != null) List_free<NdsMcNode>(&self.nodes);
+    self.first = null;
+    self.n = null;
+    self.nanims = null;
+    self.count = 0;
+}
+
+// An NMCR (RCMN) file: its multi-cells and their nodes.
+Result<NdsMultiCells, string> nmcr_read(*uint8 data, int64 len) {
+    NdsData d = NdsData{data: data, len: len};
+    if (!d.magic(0, "RCMN")) return Err<NdsMultiCells, string>("nmcr: not an NMCR file");
+    int64 sec = nds_section(&d, "KBCM");
+    if (sec < 0) return Err<NdsMultiCells, string>("nmcr: no MCBK block");
+    int64 s = sec + 8;
+    if (!d.has(s, 12)) return Err<NdsMultiCells, string>("nmcr: truncated MCBK block");
+    int n = d.u16(s);
+    int64 recs = s + d.u32(s + 4);
+    int64 props = s + d.u32(s + 8);
+    if (!d.has(recs, (int64)n * 8)) return Err<NdsMultiCells, string>("nmcr: multi-cells out of range");
+    let m: NdsMultiCells;
+    m.count = n;
+    m.first = alloc<int>((int64)n + 1);
+    m.n = alloc<int>((int64)n + 1);
+    m.nanims = alloc<int>((int64)n + 1);
+    m.nodes.init(16);
+    for (i in 0..n) {
+        int64 r = recs + (int64)i * 8;
+        int cnt = d.u16(r);
+        int64 no = props + d.u32(r + 4);
+        if (!d.has(no, (int64)cnt * 8)) {
+            NdsMultiCells_free(&m);
+            return Err<NdsMultiCells, string>("nmcr: nodes out of range");
+        }
+        m.first[i] = m.nodes.size;
+        m.n[i] = cnt;
+        m.nanims[i] = d.u16(r + 2);
+        for (k in 0..cnt) {
+            int64 p = no + (int64)k * 8;
+            m.nodes.push(NdsMcNode{seq: d.u16(p), x: d.s16(p + 2), y: d.s16(p + 4), mode: d.u8(p + 6), anim: d.u8(p + 7)});
+        }
+    }
+    return Ok<NdsMultiCells, string>(m);
+}
+
+NdsMcNode* NdsMultiCells_node(NdsMultiCells* self, int mc, int k) {
+    return &self.nodes.data[self.first[mc] + k];
+}
+
+// The frame node k of multi-cell mc shows tick ticks in, from the cells'
+// NANR anims, or null.
+NdsAnimFrame* NdsMultiCells_node_frame(NdsMultiCells* self, int mc, int k, NdsAnims* anims, int64 tick) {
+    if (mc < 0 || mc >= self.count || k < 0 || k >= self.n[mc]) return null;
+    int seq = self.node(mc, k).seq;
+    return anims.frame(seq, anims.frame_at(seq, tick));
+}
+
+// The box of multi-cell mc around its origin, tick ticks in (within 1024
+// pixels of it).
+void NdsMultiCells_bounds(NdsMultiCells* self, int mc, NdsAnims* anims, int64 tick, NdsCells* cells, *int x0, *int y0, *int x1, *int y1) {
+    *x0 = 0;
+    *y0 = 0;
+    *x1 = 0;
+    *y1 = 0;
+    if (mc < 0 || mc >= self.count) return;
+    bool any = false;
+    for (k in 0..self.n[mc]) {
+        NdsAnimFrame* f = self.node_frame(mc, k, anims, tick);
+        if (f == null) continue;
+        NdsMcNode* nd = self.node(mc, k);
+        int a0 = 0;
+        int b0 = 0;
+        int a1 = 0;
+        int b1 = 0;
+        cells.frame_bounds(f, &a0, &b0, &a1, &b1);
+        a0 = _g2d_clamp(a0 + nd.x);
+        b0 = _g2d_clamp(b0 + nd.y);
+        a1 = _g2d_clamp(a1 + nd.x);
+        b1 = _g2d_clamp(b1 + nd.y);
+        if (!any || a0 < *x0) *x0 = a0;
+        if (!any || b0 < *y0) *y0 = b0;
+        if (!any || a1 > *x1) *x1 = a1;
+        if (!any || b1 > *y1) *y1 = b1;
+        any = true;
+    }
+}
+
+// Draws multi-cell mc tick ticks in, with its origin at (ox, oy): each node
+// draws the frame its sequence shows then, the last node first so the first
+// is on top.
+void NdsMultiCells_draw(NdsMultiCells* self, int mc, NdsAnims* anims, int64 tick, NdsCells* cells, NdsTiles* tiles, NdsPalette* pal, NdsImage* dst, int ox, int oy) {
+    if (mc < 0 || mc >= self.count) return;
+    for (int k = self.n[mc] - 1; k >= 0; k--) {
+        NdsAnimFrame* f = self.node_frame(mc, k, anims, tick);
+        if (f == null) continue;
+        NdsMcNode* nd = self.node(mc, k);
+        cells.draw_frame(f, tiles, pal, dst, ox + nd.x, oy + nd.y);
+    }
 }
