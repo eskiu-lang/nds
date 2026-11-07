@@ -5,8 +5,9 @@
 // <nds/bin> bounds-checked reads, <nds/lz> LZ10, LZ11 and BLZ, <nds/narc>
 // NARC archives, <nds/rom> ROM headers, file systems and overlays,
 // <nds/sdat> sound archives and their synthesizer, <nds/wav> WAV files,
-// <nds/image> RGBA images and PNG, <nds/graphics> 2D graphics, <nds/model>
-// 3D textures and models.
+// <nds/image> RGBA images and PNG, <nds/graphics> 2D graphics and cell
+// animations, <nds/model> 3D textures and models, <nds/text> Gen 4 and Gen 5
+// message files.
 
 import <nds/bin>;
 import <nds/lz>;
@@ -17,3 +18,4 @@ import <nds/wav>;
 import <nds/image>;
 import <nds/graphics>;
 import <nds/model>;
+import <nds/text>;

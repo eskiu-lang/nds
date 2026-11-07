@@ -1,0 +1,63 @@
+// Prints the messages of Gen 4 or Gen 5 message files, one "INDEX TEXT" line
+// each, for tools/compare_text.py:
+//
+//     text_dump [-c] [-m CHARMAP] FILE...
+//
+// -c writes control codes (without it they are left out, as tools/nds/text4.py
+// does); -m reads Gen 4 characters through a charmap.txt (the pret projects'
+// format), without which they print as \xHHHH codes.
+//
+// A line per file "== FILE" comes first. The generation is detected.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <nds/bin>;
+import <nds/text>;
+
+int mode = NDS_TEXT_PLAIN;
+int first = 1;
+NdsCharmap map;
+*NdsCharmap mp = null;
+while (first < argc && argv[first][0] == '-') {
+    if (strcmp(argv[first], "-c") == 0) {
+        mode = NDS_TEXT_CONTROLS;
+        first++;
+    } else if (strcmp(argv[first], "-m") == 0 && first + 1 < argc) {
+        Result<NdsCharmap, string> m = nds_charmap_load(argv[first + 1]);
+        if (!m.ok) {
+            printf("error: %s: %s\n", argv[first + 1], m.error);
+            return 1;
+        }
+        map = m.value;
+        mp = &map;
+        first += 2;
+    } else {
+        break;
+    }
+}
+int bad = 0;
+for (int a = first; a < argc; a++) {
+    printf("== %s\n", argv[a]);
+    Result<NdsData, string> d = nds_read_file(argv[a]);
+    if (!d.ok) {
+        printf("error: %s\n", d.error);
+        bad++;
+        continue;
+    }
+    Result<NdsText, string> r = nds_text_read(d.value.data, d.value.len, mp);
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        bad++;
+    } else {
+        NdsText t = r.value;
+        for (i in 0..t.count) {
+            string s = t.text(i, mode);
+            printf("%d %s\n", i, s);
+            free((*void)s);
+        }
+        t.free();
+    }
+    free((*void)d.value.data);
+}
+return bad > 0 ? 1 : 0;

@@ -1,0 +1,509 @@
+// text.esk: the message files of the Gen 4 and Gen 5 Pokémon games (the
+// msgdata NARC of Diamond, Pearl, Platinum, HeartGold and SoulSilver; the
+// a/0/0/2 and a/0/0/3 NARCs of Black, White and their sequels).
+//
+//     NdsCharmap map = nds_charmap_load("charmap.txt")?;   // Gen 4 only
+//     defer map.free();
+//     NdsText t = gen4_text_read(f.data, f.len, &map)?;
+//     defer t.free();
+//     for (i in 0..t.count) {
+//         string s = t.text(i, NDS_TEXT_CONTROLS);
+//         printf("%d %s\n", i, s);
+//         free((*void)s);
+//     }
+//
+// - Gen 4: a count and a seed, then an offset and a size per message, each
+//   XORed with a key from the seed and the message's number. A message is
+//   16-bit codes XORed with a key that starts from the message's number and
+//   steps by 0x493D. Codes are game characters, turned into Unicode by a
+//   character table the caller loads (NdsCharmap: the package ships none); a
+//   message that starts with 0xF100 packs them in 9 bits, 15 bits to a word.
+// - Gen 5: a header (block and entry counts, the first block's size, the
+//   block offsets) and blocks (usually one) of entries, each an offset from
+//   its block and a length.
+//   A message is decrypted from its end: the last code is the 0xFFFF that
+//   ends it, which gives the key, and the key turns right by 3 bits per code
+//   going back. Codes are Unicode characters; the 9-bit form packs them 16
+//   bits to a word.
+//
+// Messages are kept as items: characters, line breaks, the two page codes
+// of Gen 4 (scroll and clear) and control codes with their arguments (text
+// variables, colors, sizes, waits), so a tool can rebuild the text or turn
+// the codes into its own markup. NdsText_text writes one message as UTF-8.
+
+import <mem>;
+import <list>;
+import <bytes>;
+import <result>;
+import <nds/bin>;
+
+// Item kinds.
+const int NDS_TEXT_CHAR = 0;
+const int NDS_TEXT_NEWLINE = 1;
+const int NDS_TEXT_SCROLL = 2;
+const int NDS_TEXT_CLEAR = 3;
+const int NDS_TEXT_CONTROL = 4;
+const int NDS_TEXT_UNKNOWN = 5;
+
+// NdsText_text modes.
+const int NDS_TEXT_PLAIN = 0;
+const int NDS_TEXT_CONTROLS = 1;
+
+// One item of a message. A character's value is its Unicode code point; an
+// unknown code's value is the code itself (in Gen 4, a code the character table
+// does not map, or every character when no table is given); a control code's value is its
+// command, and its nargs arguments are at args[arg].
+struct NdsTextItem {
+    int kind;
+    int value;
+    int arg;
+    int nargs;
+}
+
+struct NdsMessage {
+    int first;
+    int count;
+    bool compressed;
+}
+
+// The messages of a file. For Gen 5, message b * entries + e is entry e of
+// block b (most files have one block).
+struct NdsText {
+    int gen;
+    int count;
+    int blocks;
+    int entries;
+    *NdsMessage msgs;
+    List<NdsTextItem> items;
+    List<int> args;
+    *NdsCharmap map;    // while a Gen 4 file is read
+}
+
+// The Gen 4 character table: game code k is Unicode code point chars[k] (0:
+// none). The games' own table is not part of this package (no public source
+// for it carries a license); a caller loads one, such as the charmap.txt of
+// the pret decompilation projects, with nds_charmap_load or nds_charmap_read.
+struct NdsCharmap {
+    int count;
+    *int chars;
+}
+
+void NdsCharmap_free(NdsCharmap* self) {
+    if (self.chars != null) free((*void)self.chars);
+    self.chars = null;
+    self.count = 0;
+}
+
+// The code point of the UTF-8 sequence at s[i..n), its length in *w, or -1.
+int _txt_utf8_at(*uint8 s, int64 i, int64 n, *int w) {
+    int b = (int)s[i];
+    int len = b < 0x80 ? 1 : (b & 0xE0) == 0xC0 ? 2 : (b & 0xF0) == 0xE0 ? 3 : (b & 0xF8) == 0xF0 ? 4 : 0;
+    if (len == 0 || i + (int64)len > n) return -1;
+    int c = len == 1 ? b : len == 2 ? b & 0x1F : len == 3 ? b & 0x0F : b & 0x07;
+    for (k in 1..len) {
+        int x = (int)s[i + (int64)k];
+        if ((x & 0xC0) != 0x80) return -1;
+        c = (c << 6) | (x & 0x3F);
+    }
+    *w = len;
+    return c;
+}
+
+int _txt_hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+// A character table in the pret projects' charmap.txt format: one line
+// "HHHH=c" per code (four hex digits, then one character in UTF-8), comment
+// lines starting with //, and the function codes after a line starting with
+// "// Function codes", which are not characters and are not read. Lines that
+// map a code to more than one character are skipped, as are codes from 0x0E00
+// up (the line break, the page codes and the controls are read by the parser).
+Result<NdsCharmap, string> nds_charmap_read(*uint8 data, int64 len) {
+    int limit = 0x0E00;
+    *int chars = alloc<int>((int64)limit);
+    int top = 0;
+    int64 i = 0;
+    int[1] w;
+    while (i < len) {
+        int64 e = i;
+        while (e < len && data[e] != (uint8)10) e++;
+        int64 end = e;
+        if (end > i && data[end - 1] == (uint8)13) end--;
+        int64 s = i;
+        while (s < end && (data[s] == (uint8)32 || data[s] == (uint8)9)) s++;
+        if (end - s >= 16 && memcmp((*void)(data + s), (*void)"// Function codes", 16) == 0) break;
+        if (end - s >= 6 && data[s + 4] == (uint8)61 && !(data[s] == (uint8)47 && data[s + 1] == (uint8)47)) {
+            int code = 0;
+            for (k in 0..4) {
+                int h = _txt_hexval((int)data[s + (int64)k]);
+                code = h < 0 ? -1 : code < 0 ? -1 : code * 16 + h;
+            }
+            int c = _txt_utf8_at(data, s + 5, end, &w[0]);
+            if (code > 0 && code < limit && c > 0 && s + 5 + (int64)w[0] == end) {
+                chars[code] = c;
+                if (code + 1 > top) top = code + 1;
+            }
+        }
+        i = e + 1;
+    }
+    if (top == 0) {
+        free((*void)chars);
+        return Err<NdsCharmap, string>("charmap: no character lines (HHHH=c)");
+    }
+    return Ok<NdsCharmap, string>(NdsCharmap{count: top, chars: chars});
+}
+
+Result<NdsCharmap, string> nds_charmap_load(string path) {
+    NdsData d = nds_read_file(path)?;
+    Result<NdsCharmap, string> r = nds_charmap_read(d.data, d.len);
+    free((*void)d.data);
+    return r;
+}
+
+void NdsText_free(NdsText* self) {
+    if (self.msgs != null) free((*void)self.msgs);
+    if (self.items.data != null) List_free<NdsTextItem>(&self.items);
+    if (self.args.data != null) List_free<int>(&self.args);
+    self.msgs = null;
+    self.count = 0;
+}
+
+// Item k of message i, or null.
+NdsTextItem* NdsText_item(NdsText* self, int i, int k) {
+    if (i < 0 || i >= self.count || k < 0 || k >= self.msgs[i].count) return null;
+    return &self.items.data[self.msgs[i].first + k];
+}
+
+// The number of items of message i.
+int NdsText_items(NdsText* self, int i) {
+    if (i < 0 || i >= self.count) return 0;
+    return self.msgs[i].count;
+}
+
+// Argument a of control item it.
+int NdsText_arg(NdsText* self, NdsTextItem* it, int a) {
+    if (it == null || a < 0 || a >= it.nargs) return 0;
+    return self.args.data[it.arg + a];
+}
+
+// Unpacks the 9-bit form: after the 0xF100 code each word carries width
+// bits (15 in Gen 4, whose top bit is unused; 16 in Gen 5), read from the
+// low end, and each code is the next 9 bits; 0x1FF ends the message.
+// Returns the number of codes written to out (room for n * 2).
+int64 _txt_unpack9(*int w, int64 n, int width, *int out) {
+    int64 k = 0;
+    int64 bits = 0;
+    int nbits = 0;
+    for (int64 i = 1; i < n; i++) {
+        bits |= (int64)(w[i] & ((1 << width) - 1)) << nbits;
+        nbits += width;
+        while (nbits >= 9) {
+            int c = (int)(bits & 0x1FF);
+            bits >>= 9;
+            nbits -= 9;
+            if (c == 0x1FF) {
+                out[k] = 0xFFFF;
+                return k + 1;
+            }
+            out[k] = c;
+            k++;
+        }
+    }
+    return k;
+}
+
+// Turns n decrypted codes into the items of a new message. A control starts
+// with 0xFFFE in Gen 4 and 0xF000 in Gen 5, then its command, the number of
+// arguments and the arguments.
+void _txt_parse(NdsText* t, *int w, int64 n) {
+    *int buf = null;
+    bool compressed = false;
+    if (n > 0 && w[0] == 0xF100) {
+        buf = alloc<int>(n * 2 + 2);
+        n = _txt_unpack9(w, n, t.gen == 4 ? 15 : 16, buf);
+        w = buf;
+        compressed = true;
+    }
+    NdsMessage m = NdsMessage{first: t.items.size, count: 0, compressed: compressed};
+    int64 i = 0;
+    while (i < n) {
+        int c = w[i];
+        if (c == 0xFFFF) break;
+        NdsTextItem it = NdsTextItem{kind: NDS_TEXT_CHAR, value: c, arg: 0, nargs: 0};
+        bool control = t.gen == 4 ? c == 0xFFFE : c == 0xF000;
+        if (control && i + 2 < n) {
+            it.kind = NDS_TEXT_CONTROL;
+            it.value = w[i + 1];
+            int64 na = (int64)w[i + 2];
+            if (na > n - i - 3) na = n - i - 3;
+            it.arg = t.args.size;
+            it.nargs = (int)na;
+            for (int64 a = 0; a < na; a++) t.args.push(w[i + 3 + a]);
+            i += 3 + na;
+        } else {
+            if (t.gen == 4) {
+                if (c == 0xE000) {
+                    it.kind = NDS_TEXT_NEWLINE;
+                } else if (c == 0x25BC) {
+                    it.kind = NDS_TEXT_SCROLL;
+                } else if (c == 0x25BD) {
+                    it.kind = NDS_TEXT_CLEAR;
+                } else if (t.map != null && c > 0 && c < t.map.count && t.map.chars[c] != 0) {
+                    it.value = t.map.chars[c];
+                } else {
+                    it.kind = NDS_TEXT_UNKNOWN;
+                }
+            } else {
+                if (c == 0xFFFE) {
+                    it.kind = NDS_TEXT_NEWLINE;
+                } else if (c == 0 || (c >= 0xD800 && c < 0xE000)) {
+                    it.kind = NDS_TEXT_UNKNOWN;
+                }
+            }
+            i++;
+        }
+        t.items.push(it);
+        m.count++;
+    }
+    t.msgs[t.count] = m;
+    t.count++;
+    if (buf != null) free((*void)buf);
+}
+
+NdsText _txt_new(int gen, int64 n) {
+    let t: NdsText;
+    t.gen = gen;
+    t.msgs = alloc<NdsMessage>(n + 1);
+    t.items.init(64);
+    t.args.init(16);
+    return t;
+}
+
+// A Gen 4 message file, its characters through `map` (null: every character
+// is left as an unknown code).
+Result<NdsText, string> gen4_text_read(*uint8 data, int64 len, *NdsCharmap map) {
+    NdsData d = NdsData{data: data, len: len};
+    if (len < 4) return Err<NdsText, string>("text: truncated header");
+    int n = d.u16(0);
+    int seed = d.u16(2);
+    if (!d.has(4, (int64)n * 8)) return Err<NdsText, string>("text: truncated message table");
+    NdsText t = _txt_new(4, (int64)n);
+    t.map = map;
+    t.blocks = 1;
+    t.entries = n;
+    *int w = null;
+    int64 wcap = 0;
+    for (i in 0..n) {
+        int64 k = ((int64)seed * 0x2FD * (int64)(i + 1)) & 0xFFFF;
+        int64 k32 = k | (k << 16);
+        int64 off = d.u32(4 + (int64)i * 8) ^ k32;
+        int64 size = d.u32(8 + (int64)i * 8) ^ k32;
+        if (!d.has(off, size * 2)) {
+            if (w != null) free((*void)w);
+            NdsText_free(&t);
+            return Err<NdsText, string>("text: message out of range");
+        }
+        if (size + 1 > wcap) {
+            if (w != null) free((*void)w);
+            wcap = size + 1;
+            w = alloc<int>(wcap);
+        }
+        int key = (int)((0x91BD3 * (int64)(i + 1)) & 0xFFFF);
+        for (int64 j = 0; j < size; j++) {
+            w[j] = d.u16(off + j * 2) ^ key;
+            key = (key + 0x493D) & 0xFFFF;
+        }
+        _txt_parse(&t, w, size);
+    }
+    if (w != null) free((*void)w);
+    t.map = null;
+    return Ok<NdsText, string>(t);
+}
+
+// A Gen 5 message file. Not checked against a game's files: see the README.
+Result<NdsText, string> gen5_text_read(*uint8 data, int64 len) {
+    NdsData d = NdsData{data: data, len: len};
+    if (len < 12) return Err<NdsText, string>("text: truncated header");
+    int nb = d.u16(0);
+    int ne = d.u16(2);
+    if (nb < 1 || !d.has(12, (int64)nb * 4)) return Err<NdsText, string>("text: bad block table");
+    NdsText t = _txt_new(5, (int64)nb * (int64)ne);
+    t.blocks = nb;
+    t.entries = ne;
+    *int w = null;
+    int64 wcap = 0;
+    for (b in 0..nb) {
+        int64 bo = d.u32(12 + (int64)b * 4);
+        if (!d.has(bo, 4 + (int64)ne * 8)) {
+            if (w != null) free((*void)w);
+            NdsText_free(&t);
+            return Err<NdsText, string>("text: block out of range");
+        }
+        for (e in 0..ne) {
+            int64 off = bo + d.u32(bo + 4 + (int64)e * 8);
+            int64 n = d.u16(bo + 8 + (int64)e * 8);
+            if (!d.has(off, n * 2)) {
+                if (w != null) free((*void)w);
+                NdsText_free(&t);
+                return Err<NdsText, string>("text: message out of range");
+            }
+            if (n + 1 > wcap) {
+                if (w != null) free((*void)w);
+                wcap = n + 1;
+                w = alloc<int>(wcap);
+            }
+            if (n > 0) {
+                int key = d.u16(off + (n - 1) * 2) ^ 0xFFFF;
+                for (int64 j = n - 1; j >= 0; j--) {
+                    w[j] = d.u16(off + j * 2) ^ key;
+                    key = ((key >> 3) | (key << 13)) & 0xFFFF;
+                }
+            }
+            _txt_parse(&t, w, n);
+        }
+    }
+    if (w != null) free((*void)w);
+    return Ok<NdsText, string>(t);
+}
+
+// Reads either generation. A Gen 5 file starts with a block count of 1 to
+// 16, the size of its first block, a zero word and the block offsets, the
+// first right after them and starting with the same size; a Gen 4 file is
+// anything else, read through `map` as gen4_text_read does.
+Result<NdsText, string> nds_text_read(*uint8 data, int64 len, *NdsCharmap map) {
+    NdsData d = NdsData{data: data, len: len};
+    int nb = d.u16(0);
+    int64 b0 = 12 + (int64)nb * 4;
+    if (len >= 16 && nb >= 1 && nb <= 16 && d.u32(8) == 0 && d.u32(12) == b0 && d.u32(b0) == d.u32(4)) return gen5_text_read(data, len);
+    return gen4_text_read(data, len, map);
+}
+
+void _txt_utf8(Bytes* b, int c) {
+    if (c < 0x80) {
+        b.push((uint8)c);
+    } else if (c < 0x800) {
+        b.push((uint8)(0xC0 | (c >> 6)));
+        b.push((uint8)(0x80 | (c & 0x3F)));
+    } else if (c < 0x10000) {
+        b.push((uint8)(0xE0 | (c >> 12)));
+        b.push((uint8)(0x80 | ((c >> 6) & 0x3F)));
+        b.push((uint8)(0x80 | (c & 0x3F)));
+    } else {
+        b.push((uint8)(0xF0 | (c >> 18)));
+        b.push((uint8)(0x80 | ((c >> 12) & 0x3F)));
+        b.push((uint8)(0x80 | ((c >> 6) & 0x3F)));
+        b.push((uint8)(0x80 | (c & 0x3F)));
+    }
+}
+
+void _txt_str(Bytes* b, string s) {
+    for (int64 i = 0; s[i] != 0; i++) b.push((uint8)s[i]);
+}
+
+void _txt_hex(Bytes* b, int v) {
+    for (int sh = 12; sh >= 0; sh -= 4) {
+        int d = (v >> sh) & 15;
+        b.push((uint8)(d < 10 ? 48 + d : 55 + d));
+    }
+}
+
+void _txt_int(Bytes* b, int v) {
+    int64 x = (int64)v;
+    if (x < 0) {
+        b.push((uint8)'-');
+        x = -x;
+    }
+    uint8[24] tmp;
+    int n = 0;
+    while (true) {
+        tmp[n] = (uint8)(48 + (int)(x % 10));
+        n++;
+        x /= 10;
+        if (x == 0) break;
+    }
+    while (n > 0) {
+        n--;
+        b.push(tmp[n]);
+    }
+}
+
+// The name of a Gen 4 control command as the pret projects spell it, or
+// null. Text variables (groups 0x01, 0x03, 0x04, 0x34) carry their kind in
+// the low byte, written as the first value.
+string _txt_gen4_name(int cmd, *bool group) {
+    *group = false;
+    if (cmd == 0x0200) return "YESNO";
+    if (cmd == 0x0201) return "PAUSE";
+    if (cmd == 0x0202) return "WAIT";
+    if (cmd == 0x0203) return "CURSOR_X";
+    if (cmd == 0x0204) return "CURSOR_Y";
+    if (cmd == 0x0205) return "ALN_CENTER";
+    if (cmd == 0x0206) return "ALN_RIGHT";
+    if (cmd == 0x0207) return "UNK_207";
+    if (cmd == 0x0208) return "UNK_208";
+    if (cmd == 0xFF00) return "COLOR";
+    if (cmd == 0xFF01) return "SIZE";
+    if (cmd == 0xFF02) return "UNK_FF02";
+    *group = true;
+    int hi = cmd >> 8;
+    if (hi == 0x01) return "STRVAR_1";
+    if (hi == 0x03) return "STRVAR_3";
+    if (hi == 0x04) return "STRVAR_4";
+    if (hi == 0x34) return "STRVAR_34";
+    *group = false;
+    return null;
+}
+
+// Message i as UTF-8, NUL-terminated; free it with free(). Line breaks are
+// written \n, and Gen 4's scroll and clear codes \r and \f (a backslash and
+// a letter). In NDS_TEXT_CONTROLS mode a control code is written in braces,
+// its name and arguments ({STRVAR_1 1, 0, 0}, {COLOR 1}, or {CMD_XXXX ...}
+// for a command with no known name) and a code with no character as \xXXXX;
+// NDS_TEXT_PLAIN leaves both out.
+string NdsText_text(NdsText* self, int i, int mode) {
+    let b: Bytes;
+    b.init(64);
+    for (k in 0..self.items(i)) {
+        NdsTextItem* it = self.item(i, k);
+        if (it.kind == NDS_TEXT_CHAR) {
+            _txt_utf8(&b, it.value);
+        } else if (it.kind == NDS_TEXT_NEWLINE) {
+            _txt_str(&b, "\\n");
+        } else if (it.kind == NDS_TEXT_SCROLL) {
+            _txt_str(&b, "\\r");
+        } else if (it.kind == NDS_TEXT_CLEAR) {
+            _txt_str(&b, "\\f");
+        } else if (mode == NDS_TEXT_CONTROLS && it.kind == NDS_TEXT_UNKNOWN) {
+            _txt_str(&b, "\\x");
+            _txt_hex(&b, it.value);
+        } else if (mode == NDS_TEXT_CONTROLS && it.kind == NDS_TEXT_CONTROL) {
+            bool group = false;
+            string name = self.gen == 4 ? _txt_gen4_name(it.value, &group) : null;
+            b.push((uint8)'{');
+            if (name != null) {
+                _txt_str(&b, name);
+            } else {
+                _txt_str(&b, "CMD_");
+                _txt_hex(&b, it.value);
+            }
+            int n = 0;
+            if (group) {
+                b.push((uint8)' ');
+                _txt_int(&b, it.value & 0xFF);
+                n++;
+            }
+            for (a in 0..it.nargs) {
+                _txt_str(&b, n == 0 ? " " : ", ");
+                _txt_int(&b, self.args.data[it.arg + a]);
+                n++;
+            }
+            b.push((uint8)'}');
+        }
+    }
+    b.push(0);
+    return (string)b.data;
+}

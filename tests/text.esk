@@ -1,0 +1,106 @@
+// Message files: the Gen 4 and Gen 5 files of tools/gen_test_data.py,
+// encrypted there from the public descriptions of both formats, decoded to
+// the texts the generator encoded (characters, line breaks, page codes,
+// control codes with their arguments, the 9-bit form, an unknown code). The
+// Gen 4 characters go through the generator's own table, charmap_test.txt.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <nds/bin>;
+import <nds/text>;
+
+int fails = 0;
+
+void check(bool ok, string what) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+NdsData slurp(string name) {
+    let p: Bytes;
+    p.init(64);
+    p.append_raw((*uint8)"tests/data/", 11);
+    p.append_raw((*uint8)name, strlen(name));
+    p.push(0);
+    int64 n = 0;
+    *uint8 d = fs_read_all((string)p.data, &n);
+    p.free();
+    return NdsData{data: d, len: n};
+}
+
+bool text_is(NdsText* t, int i, int mode, string want) {
+    string s = t.text(i, mode);
+    bool ok = strcmp(s, want) == 0;
+    if (!ok) printf("  message %d: \"%s\", expected \"%s\"\n", i, s, want);
+    free((*void)s);
+    return ok;
+}
+
+Result<int, string> run() {
+    NdsCharmap map = nds_charmap_load("tests/data/charmap_test.txt")?;
+    defer map.free();
+    check(map.count == 0x0168 && map.chars[0x0121] == 'A' && map.chars[0x0300] == 0, "the character table (a two-character line skipped)");
+    check(!nds_charmap_read((*uint8)"// nothing\n", 11).ok && !nds_charmap_load("tests/data/none.txt").ok, "character table errors");
+
+    NdsData d4 = slurp("gen4.msg");
+    defer free((*void)d4.data);
+    NdsText t = gen4_text_read(d4.data, d4.len, &map)?;
+    defer t.free();
+    check(t.gen == 4 && t.count == 7, "Gen 4 message count");
+    check(text_is(&t, 0, NDS_TEXT_CONTROLS, "Hello, world!"), "a plain message");
+    check(text_is(&t, 1, NDS_TEXT_PLAIN, "A\\nB\\rC\\fD"), "line break, scroll and clear");
+    check(text_is(&t, 2, NDS_TEXT_CONTROLS, "Hi {STRVAR_1 1, 2, 0} and {COLOR 3}Pokémon!"), "control codes");
+    check(text_is(&t, 2, NDS_TEXT_PLAIN, "Hi  and Pokémon!"), "control codes left out");
+    check(text_is(&t, 3, NDS_TEXT_CONTROLS, "Richi") && t.msgs[3].compressed && !t.msgs[0].compressed, "the 9-bit form");
+    check(text_is(&t, 4, NDS_TEXT_CONTROLS, "x\\x0DFFy") && text_is(&t, 4, NDS_TEXT_PLAIN, "xy"), "an unknown code");
+    check(text_is(&t, 5, NDS_TEXT_CONTROLS, "") && t.items(5) == 0, "an empty message");
+    check(text_is(&t, 6, NDS_TEXT_CONTROLS, "{YESNO}¿Sí?{CMD_1234 7}"), "commands without and with a name");
+    // the tagged items
+    NdsTextItem* it = t.item(2, 3);
+    check(it.kind == NDS_TEXT_CONTROL && it.value == 0x0101 && it.nargs == 2 && t.arg(it, 0) == 2 && t.arg(it, 1) == 0 && t.arg(it, 2) == 0, "a control item");
+    it = t.item(1, 1);
+    check(it.kind == NDS_TEXT_NEWLINE && t.item(1, 3).kind == NDS_TEXT_SCROLL && t.item(1, 5).kind == NDS_TEXT_CLEAR, "page items");
+    check(t.item(0, 0).kind == NDS_TEXT_CHAR && t.item(0, 0).value == 'H' && t.item(4, 1).kind == NDS_TEXT_UNKNOWN && t.item(4, 1).value == 0x0DFF, "character and unknown items");
+    check(t.item(0, 99) == null && t.item(9, 0) == null && t.items(9) == 0, "items out of range");
+
+    NdsData d5 = slurp("gen5.msg");
+    defer free((*void)d5.data);
+    NdsText u = gen5_text_read(d5.data, d5.len)?;
+    defer u.free();
+    check(u.gen == 5 && u.count == 6 && u.blocks == 2 && u.entries == 3, "Gen 5 blocks and entries");
+    check(text_is(&u, 0, NDS_TEXT_CONTROLS, "Bonjour\\nle monde"), "a Gen 5 line break");
+    check(text_is(&u, 1, NDS_TEXT_CONTROLS, "Ciao {CMD_BD02 1, 5}!"), "a Gen 5 control code");
+    check(text_is(&u, 2, NDS_TEXT_CONTROLS, "Jordi") && u.msgs[2].compressed, "the Gen 5 9-bit form");
+    check(text_is(&u, 3, NDS_TEXT_CONTROLS, "Ünïcödé ★"), "Unicode characters");
+    check(text_is(&u, 4, NDS_TEXT_CONTROLS, "") && text_is(&u, 5, NDS_TEXT_PLAIN, "end"), "the second block");
+
+    // the generation is detected
+    Result<NdsText, string> a = nds_text_read(d4.data, d4.len, &map);
+    Result<NdsText, string> b = nds_text_read(d5.data, d5.len, null);
+    check(a.ok && a.value.gen == 4 && b.ok && b.value.gen == 5, "nds_text_read");
+    if (a.ok) a.value.free();
+    if (b.ok) b.value.free();
+
+    // without a table, every Gen 4 character is an unknown code
+    NdsText raw = gen4_text_read(d4.data, d4.len, null)?;
+    defer raw.free();
+    check(raw.item(0, 0).kind == NDS_TEXT_UNKNOWN && raw.item(0, 0).value == 0x0128 && raw.item(1, 1).kind == NDS_TEXT_NEWLINE, "Gen 4 without a table");
+
+    // errors
+    check(!gen4_text_read(d4.data, 2, &map).ok && !gen4_text_read(d4.data, 30, &map).ok && !gen4_text_read(d4.data, d4.len - 4, &map).ok, "a Gen 4 file cut short");
+    check(!gen5_text_read(d5.data, 10).ok && !gen5_text_read(d5.data, d5.len - 6).ok, "a Gen 5 file cut short");
+    return Ok<int, string>(0);
+}
+
+Result<int, string> r = run();
+if (!r.ok) {
+    printf("FAIL %s\n", r.error);
+    fails++;
+}
+
+if (fails > 0) return 1;
+printf("text: ok\n");
