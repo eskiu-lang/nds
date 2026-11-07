@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Writes the synthetic test files in tests/data:
 
-    python3 -I tools/gen_test_data.py [--ref SDAT_WAV]
+    python3 -I tools/gen_test_data.py [--ref SDAT_WAV] [--only sdat,sdat_arc,lz,archives,graphics,anims,text,textures]
 
 Everything is built here from fixed seeds and known values; no file comes from a game.
 
@@ -10,6 +10,12 @@ Everything is built here from fixed seeds and known values; no file comes from a
   sequences. sdat.txt lists the names, the waves' expected PCM and the renders.
   With --ref (the Tallgrass engine's sdat_wav example), the renders are made by the
   engine and written as tests/data/*.wav: the tests compare <nds/sdat> with them.
+- test_arc.sdat: an SSAR whose sound effects are also stored as SSEQs (the tests render
+  both and compare) and three STRMs (PCM8, PCM16 and IMA-ADPCM in blocks) with the PCM
+  they decode to (sdat_arc.txt, strm*.pcm).
+- anims.nanr, anims.nmar, anims.nmcr: cell animations over cells.ncer with the frames
+  they draw (anims.txt, anim*.rgba, multicell*.rgba).
+- gen4.msg, gen5.msg: message files encrypted as the public descriptions say.
 - NARCs (named and unnamed), a small .nds ROM with a BLZ overlay, LZ10 and LZ11
   streams, NCLR/NCGR/NSCR/NCER files, an NSBTX with each of the seven texture formats
   and an NSBMD; each with the expected pixels, bytes or triangles next to it.
@@ -467,6 +473,215 @@ def gen_sdat(ref):
 
 
 # ---------------------------------------------------------------------------
+# Sound: SSAR sequence archives and STRM streams (test_arc.sdat)
+
+def se_short(s, tag):
+    """A one-track sound effect: a PCM8 note, a call into a shared routine, a PSG note."""
+    s.prog(0)
+    s.raw(0xC1, 120)
+    s.note(64, 110, 20)
+    s.raw(0x95)
+    s.ref(f"{tag}_sub")
+    s.prog(3)
+    s.note(81, 90, 30)
+    s.raw(0xFF)
+    s.label(f"{tag}_sub")
+    s.note(67, 100, 10)
+    s.note(71, 100, 10)
+    s.raw(0xFD)
+
+
+def se_multi(s, tag):
+    """A two-track sound effect (multitrack header, a drum track), ending with a jump back."""
+    s.raw(0xFE, 0x03, 0x00, 0x93, 1)
+    s.ref(f"{tag}_t1")
+    s.prog(2)
+    s.raw(0xC0, 30)
+    s.note(52, 100, 24)
+    s.note(76, 90, 24)
+    s.raw(0xFF)
+    s.label(f"{tag}_t1")
+    s.prog(1)
+    s.label(f"{tag}_top")
+    s.note(36, 127, 12)
+    s.note(38, 100, 12)
+    s.raw(0x94)
+    s.ref(f"{tag}_top")
+
+
+def make_ssar(code, entries):
+    """entries: (offset into code, bank, vol, cpr, ppr, player)."""
+    head = 0x20 + 12 * len(entries)
+    recs = b"".join(u32(o) + u16(b) + bytes([v, c, p, pl]) + u16(0) for o, b, v, c, p, pl in entries)
+    data = b"DATA" + u32(8 + 8 + len(recs) + len(code)) + u32(head) + u32(len(entries)) + recs + code
+    return pad(nitro_header(b"SSAR", 0xFEFF, 0x10 + len(data), 1) + data, 4)
+
+
+def make_strm(kind, looped, channels, rate, loop_start, blocks, bs, ls):
+    """blocks: per block, the raw data of each channel (all but the last the same size);
+    bs and ls: the samples in a block and in the last one. Returns the file."""
+    nblocks = len(blocks)
+    blen = len(blocks[0][0])
+    last = len(blocks[-1][0])
+    nsamp = bs * (nblocks - 1) + ls
+    head = (b"HEAD" + u32(0x50) + bytes([kind, 1 if looped else 0, channels, 0]) + u16(rate)
+            + u16(16756991 // 32 // rate) + u32(loop_start) + u32(nsamp) + u32(0x68) + u32(nblocks)
+            + u32(blen) + u32(bs) + u32(last) + u32(ls) + b"\0" * 32)
+    body = b"".join(b"".join(chs) for chs in blocks)
+    data = b"DATA" + u32(8 + len(body)) + body
+    return nitro_header(b"STRM", 0xFEFF, 0x10 + len(head) + len(data), 2) + head + data
+
+
+def make_strms():
+    """Three streams and the interleaved PCM <nds/sdat> must decode from each."""
+    out = []
+    # PCM8 mono, one block, looped
+    p8 = [int(100 * math.sin(2 * math.pi * k / 25)) for k in range(300)]
+    out.append((make_strm(0, True, 1, 11025, 40, [[bytes(v & 0xFF for v in p8)]], 300, 300), [v << 8 for v in p8], 1, 11025, True, 40, 0))
+    # PCM16 stereo, two blocks of 256 samples and a last one of 100
+    left = [int(20000 * math.sin(2 * math.pi * k / 64)) for k in range(612)]
+    right = [int(15000 * math.sin(2 * math.pi * k / 37 + 1)) for k in range(612)]
+    blocks = []
+    for st, n in ((0, 256), (256, 256), (512, 100)):
+        blocks.append([b"".join(struct.pack("<h", v) for v in ch[st:st + n]) for ch in (left, right)])
+    pcm = [v for pair in zip(left, right) for v in pair]
+    out.append((make_strm(1, False, 2, 22050, 0, blocks, 256, 100), pcm, 2, 22050, False, 0, 1))
+    # IMA-ADPCM stereo, blocks of 200 samples, each with its own header; a last one of 58
+    left = [int(18000 * math.sin(2 * math.pi * k / 50) + 5000 * math.sin(2 * math.pi * k / 9)) for k in range(458)]
+    right = [int(-12000 * math.sin(2 * math.pi * k / 31)) for k in range(458)]
+    blocks, decl, decr = [], [], []
+    for st, n in ((0, 200), (200, 200), (400, 58)):
+        chs = []
+        for ch, dec in ((left, decl), (right, decr)):
+            data, d = adpcm_encode(ch[st:st + n])
+            chs.append(pad(data, 4))
+            dec += d[:n]
+        blocks.append(chs)
+    pcm = [v for pair in zip(decl, decr) for v in pair]
+    out.append((make_strm(2, True, 2, 32728, 100, blocks, 200, 58), pcm, 2, 32728, True, 100, 2))
+    return out
+
+
+def make_sdat_arc(files, seqs, ssars, banks, wavearcs, strms, names):
+    """An SDAT with sequences, sequence archives and streams. seqs: (file, bank, vol);
+    ssars: file; banks: (file, [wa x4]); wavearcs: file; strms: (file, vol);
+    names: {"seq": [...], "ssar": [(name, [entry names])], "wavearc": [...], "strm": [...]}."""
+    def symb_block():
+        head = 8 + 8 * 4 + 24
+        flat = [names.get("seq", []), None, [], names.get("wavearc", []), [], [], [], names.get("strm", [])]
+        arcs = names.get("ssar", [])
+        sizes = [4 + 4 * len(n) if n is not None else 4 + 8 * len(arcs) for n in flat]
+        sub_at = head + sum(sizes)
+        subs = b""
+        sub_offs = []
+        for _, entries in arcs:
+            sub_offs.append(sub_at + len(subs))
+            subs += u32(len(entries)) + b"\0" * (4 * len(entries))
+        strings_at = sub_at + len(subs)
+        strs = bytearray()
+
+        def name_off(n):
+            if n is None:
+                return 0
+            o = strings_at + len(strs)
+            strs.extend(n.encode() + b"\0")
+            return o
+        recs, offs = b"", []
+        subs = bytearray(subs)
+        for cat, n in enumerate(flat):
+            offs.append(head + len(recs))
+            if n is None:
+                r = u32(len(arcs))
+                for k, (an, entries) in enumerate(arcs):
+                    r += u32(name_off(an)) + u32(sub_offs[k])
+                    at = sub_offs[k] - sub_at + 4
+                    for j, en in enumerate(entries):
+                        subs[at + 4 * j:at + 4 * j + 4] = u32(name_off(en))
+                recs += r
+            else:
+                recs += u32(len(n)) + b"".join(u32(name_off(x)) for x in n)
+        body = b"".join(u32(o) for o in offs) + b"\0" * 24 + recs + bytes(subs) + bytes(strs)
+        return pad(b"SYMB" + u32(8 + len(body)) + body, 4)
+
+    def info_block():
+        head = 8 + 8 * 4 + 24
+        cats = [
+            [u16(f) + u16(0) + u16(b) + bytes([v, 64, 64, 0]) + u16(0) for f, b, v in seqs],
+            [u16(f) + u16(0) for f in ssars],
+            [u16(f) + u16(0) + b"".join(u16(w) for w in wa) for f, wa in banks],
+            [u16(w) + u16(0) for w in wavearcs],
+            [], [], [],
+            [u16(f) + u16(0) + bytes([v, 64, 0]) + b"\0" * 5 for f, v in strms],
+        ]
+        entries_at = head + sum(4 + 4 * len(c) for c in cats)
+        recs, ents, offs = b"", b"", []
+        for c in cats:
+            offs.append(head + len(recs))
+            r = u32(len(c))
+            for e in c:
+                r += u32(entries_at + len(ents))
+                ents += pad(e, 4)
+            recs += r
+        body = b"".join(u32(o) for o in offs) + b"\0" * 24 + recs + ents
+        return pad(b"INFO" + u32(8 + len(body)) + body, 4)
+
+    symb, info = symb_block(), info_block()
+    fat_size = 12 + 16 * len(files)
+    symb_at = 0x40
+    info_at = symb_at + len(symb)
+    fat_at = info_at + len(info)
+    file_at = fat_at + fat_size
+    body, offs = b"", []
+    first = file_at + 16
+    for f in files:
+        body = pad(body, 0x20)
+        offs.append(first + len(body))
+        body += f
+    file_blk = b"FILE" + u32(16 + len(body)) + u32(len(files)) + u32(0) + body
+    fat = b"FAT " + u32(fat_size) + u32(len(files)) + b"".join(u32(o) + u32(len(f)) + b"\0" * 8 for o, f in zip(offs, files))
+    head = nitro_header(b"SDAT", 0xFEFF, file_at + len(file_blk), 4, 0x40)
+    head += u32(symb_at) + u32(len(symb)) + u32(info_at) + u32(len(info)) + u32(fat_at) + u32(fat_size) + u32(file_at) + u32(len(file_blk))
+    return head.ljust(0x40, b"\0") + symb + info + fat + file_blk
+
+
+def gen_sdat_arc():
+    """test_arc.sdat: the sound effects of an SSAR next to the same code as SSEQs (the
+    tests render both and compare), and three streams with their expected PCM."""
+    waves, _ = make_waves()
+    files = [make_sbnk(), make_swar(waves)]
+    # the archive: filler, then the two effects; entry 2 points past the code
+    s = Seq()
+    s.raw(0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
+    s.label("e0")
+    se_short(s, "a")
+    s.label("e1")
+    se_multi(s, "b")
+    code = s.done()
+    entries = [(s.labels["e0"], 0, 100, 64, 64, 1), (s.labels["e1"], 0, 90, 32, 16, 2), (len(code) + 50, 0, 80, 0, 0, 0)]
+    files.append(make_ssar(code, entries))
+    for fn in (se_short, se_multi):
+        q = Seq()
+        fn(q, "x")
+        files.append(make_sseq(q.done()))
+    strms = make_strms()
+    for st in strms:
+        files.append(st[0])
+    sdat = make_sdat_arc(files, [(3, 0, 100), (4, 0, 90)], [2], [(0, [1, 0xFFFF, 0xFFFF, 0xFFFF])], [1],
+                         [(5, 100), (6, 127), (7, 64)],
+                         {"seq": ["SEQ_SE_A", "SEQ_SE_B"], "ssar": [("SEQARC_SE", ["SE_A", "SE_B", None])],
+                          "wavearc": ["WAVE_ARC_TEST"], "strm": ["STRM_PCM8", "STRM_PCM16", "STRM_ADPCM"]})
+    write("test_arc.sdat", sdat)
+    lines = ["# ssar ARCHIVE ENTRY OFFSET BANK VOL CPR PPR PLAYER (same as seq SEQ)"]
+    lines.append(f"ssar 0 0 {entries[0][0]} 0 100 64 64 1 seq 0")
+    lines.append(f"ssar 0 1 {entries[1][0]} 0 90 32 16 2 seq 1")
+    for k, (_, pcm, ch, rate, looped, ls, _) in enumerate(strms):
+        write(f"strm{k}.pcm", b"".join(struct.pack("<h", v) for v in pcm))
+        lines.append(f"strm {k} strm{k}.pcm {len(pcm) // ch} {ch} {rate} {1 if looped else 0} {ls}")
+    with open(os.path.join(DATA, "sdat_arc.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Compression: LZ10, LZ11, BLZ
 
 def lz_matches(data, i, max_len, max_dist, min_dist=1):
@@ -865,6 +1080,242 @@ def gen_graphics():
 
 
 # ---------------------------------------------------------------------------
+# Cell animations: NANR, NMAR, NMCR over cells.ncer
+
+def read_raw_image(name):
+    d = open(os.path.join(DATA, name), "rb").read()
+    w, h = struct.unpack_from("<II", d, 0)
+    return w, h, [tuple(d[8 + 4 * k:12 + 4 * k]) for k in range(w * h)]
+
+
+def abnk(seqs, kinds):
+    """seqs: (kind, cell_type, loop, frames); a frame is (cell, duration, rot, sx, sy, x, y).
+    Returns the ABNK block."""
+    seq_tab, frame_tab, props = b"", b"", b""
+    for kind, ctype, loop, frames in seqs:
+        seq_tab += u32(len(frames)) + u16(kind) + u16(ctype) + u32(loop) + u32(len(frame_tab))
+        for cell, dur, rot, sx, sy, x, y in frames:
+            if kind == 1:
+                props = pad(props, 4)
+            frame_tab += u32(len(props)) + u16(dur) + u16(0xBEEF)
+            if kind == 0:
+                props += u16(cell)
+            elif kind == 1:
+                props += u16(cell) + u16(rot) + u32(sx) + u32(sy) + struct.pack("<hh", x, y)
+            else:
+                props = pad(props, 4)
+                props += u16(cell) + u16(0xBEEF) + struct.pack("<hh", x, y)
+        props = pad(props, 4)
+    head = 0x18
+    body = (u16(len(seqs)) + u16(sum(len(q[3]) for q in seqs)) + u32(head) + u32(head + len(seq_tab))
+            + u32(head + len(seq_tab) + len(frame_tab)) + u32(0) + u32(0) + seq_tab + frame_tab + props)
+    return b"KNBA" + u32(8 + len(body)) + body
+
+
+def inverse(rot, sx, sy):
+    a = rot * 2 * math.pi / 65536
+    c, s = math.cos(a), math.sin(a)
+    return c / (sx / 4096), s / (sx / 4096), -s / (sy / 4096), c / (sy / 4096)
+
+
+def frame_box(cell_box, f):
+    cell, dur, rot, sx, sy, fx, fy = f
+    x0, y0, x1, y1 = cell_box[cell]
+    if (rot, sx, sy) != (0, 4096, 4096):
+        m = inverse(rot, sx, sy)
+        det = m[0] * m[3] - m[1] * m[2]
+        fa, fb, fc, fd = m[3] / det, -m[1] / det, -m[2] / det, m[0] / det
+        xs = [fa * px + fb * py for px in (x0, x1) for py in (y0, y1)]
+        ys = [fc * px + fd * py for px in (x0, x1) for py in (y0, y1)]
+        x0, y0, x1, y1 = math.floor(min(xs)), math.floor(min(ys)), -math.floor(-max(xs)), -math.floor(-max(ys))
+    return x0 + fx, y0 + fy, x1 + fx, y1 + fy
+
+
+def draw_frame(px, w, h, ox, oy, cell_img, cell_box, f):
+    """Draws frame f on px (w x h) with the origin at (ox, oy), as NdsCells_draw_frame
+    is specified: identity frames copy the cell, others sample it at each pixel's center."""
+    cell, dur, rot, sx, sy, fx, fy = f
+    cw, ch, cpx = cell_img[cell]
+    cx0, cy0, _, _ = cell_box[cell]
+    if (rot, sx, sy) == (0, 4096, 4096):
+        for y in range(ch):
+            for x in range(cw):
+                p = cpx[y * cw + x]
+                tx, ty = ox + fx + cx0 + x, oy + fy + cy0 + y
+                if p[3] and 0 <= tx < w and 0 <= ty < h:
+                    px[ty * w + tx] = p
+        return
+    m = inverse(rot, sx, sy)
+    x0, y0, x1, y1 = frame_box(cell_box, f)
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            dx, dy = x - fx + 0.5, y - fy + 0.5
+            sxp = math.floor(m[0] * dx + m[1] * dy) - cx0
+            syp = math.floor(m[2] * dx + m[3] * dy) - cy0
+            if 0 <= sxp < cw and 0 <= syp < ch:
+                p = cpx[syp * cw + sxp]
+                tx, ty = ox + x, oy + y
+                if p[3] and 0 <= tx < w and 0 <= ty < h:
+                    px[ty * w + tx] = p
+
+
+def gen_anims():
+    """anims.nanr: three sequences over the two cells of cells.ncer (cell images from
+    cell0.rgba and cell1.rgba), with the frames each must render to; anims.nmar and
+    anims.nmcr: multi-cells playing them."""
+    cell_img = {0: read_raw_image("cell0.rgba"), 1: read_raw_image("cell1.rgba")}
+    cell_box = {0: (-8, -8, 16, 12), 1: (-4, -12, 10, 6)}
+    for c in (0, 1):
+        x0, y0, x1, y1 = cell_box[c]
+        assert (x1 - x0, y1 - y0) == cell_img[c][:2]
+    seqs = [
+        (0, 1, 2, [(0, 5, 0, 4096, 4096, 0, 0), (1, 3, 0, 4096, 4096, 0, 0)]),
+        (1, 1, 1, [(0, 4, 0x4000, 4096, 4096, 2, -3), (1, 2, 0, 8192, 4096, 0, 0), (0, 6, 0x2000, 6144, 3072, -1, 1)]),
+        (2, 1, 4, [(1, 2, 0, 4096, 4096, 5, 1), (0, 2, 0, 4096, 4096, -1, 0), (1, 2, 0, 4096, 4096, 0, 0)]),
+    ]
+    write("anims.nanr", file_with_blocks(b"RNAN", [abnk(seqs, None)]))
+    lines = []
+    for si, (kind, ctype, loop, frames) in enumerate(seqs):
+        lines.append(f"seq {si} {kind} {ctype} {loop} {len(frames)}")
+        boxes = [frame_box(cell_box, f) for f in frames]
+        x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+        x1, y1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+        w, h = x1 - x0, y1 - y0
+        for k, f in enumerate(frames):
+            lines.append("frame " + " ".join(str(v) for v in f))
+            px = [(0, 0, 0, 0)] * (w * h)
+            draw_frame(px, w, h, -x0, -y0, cell_img, cell_box, f)
+            write(f"anim{si}_{k}.rgba", raw_image(w, h, px))
+    # an NMAR: one multi-cell sequence
+    write("anims.nmar", file_with_blocks(b"RAMN", [abnk([(2, 2, 2, [(0, 10, 0, 4096, 4096, 3, 3), (1, 10, 0, 4096, 4096, 0, 0)])], None)]))
+    # an NMCR: multi-cell 0 plays sequences 0 and 2, multi-cell 1 sequence 1
+    mcs = [[(0, 0, 0, 0x20, 0), (2, 10, 4, 0x21, 1)], [(1, -3, 2, 0x21, 0)]]
+    recs, nodes = b"", b""
+    for m in mcs:
+        recs += u16(len(m)) + u16(len(m)) + u32(len(nodes))
+        for seq, x, y, mode, slot in m:
+            nodes += u16(seq) + struct.pack("<hh", x, y) + bytes([mode, slot])
+    body = u16(len(mcs)) + u16(0xBEEF) + u32(0x14) + u32(0x14 + len(recs)) + u32(0) + u32(0) + recs + nodes
+    write("anims.nmcr", file_with_blocks(b"RCMN", [b"KBCM" + u32(8 + len(body)) + body]))
+    # multi-cell 0 at tick 6 (sequence 0 shows cell 1, sequence 2 its frame 1... at 6:
+    # forward 0,1,2 then back 1 -> frame 1 at ticks 2..3, frame 2 at 4..5, frame 1 at 6..7)
+    for tick, want in ((0, [(0, 0), (2, 0)]), (6, [(0, 1), (2, 1)])):
+        frames = []
+        for (seq, x, y, mode, slot), (s_, k) in zip(mcs[0], want):
+            f = seqs[s_][3][k]
+            frames.append((f[0], f[1], f[2], f[3], f[4], f[5] + x, f[6] + y))
+        boxes = [frame_box(cell_box, f) for f in frames]
+        x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+        x1, y1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+        w, h = x1 - x0, y1 - y0
+        px = [(0, 0, 0, 0)] * (w * h)
+        for f in reversed(frames):
+            draw_frame(px, w, h, -x0, -y0, cell_img, cell_box, f)
+        write(f"multicell0_t{tick}.rgba", raw_image(w, h, px))
+        lines.append(f"multicell 0 tick {tick} box {x0} {y0} {x1} {y1}")
+    with open(os.path.join(DATA, "anims.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Text: Gen 4 and Gen 5 message files
+
+def gen4_codes():
+    """A character table of our own for the Gen 4 tests (the games' table is not part of
+    the package), written as charmap_test.txt in the pret projects' charmap.txt format:
+    printable ASCII and a few accented characters at codes from 0x0100 (below 0x1FF, so
+    the 9-bit form holds them), a comment, a line mapping a code to two characters
+    (skipped by the reader) and function codes after the marker line (not read).
+    Character to code."""
+    chars = [chr(c) for c in range(0x20, 0x7F)] + list("¿¡éíóúÉñ★")
+    table = {ch: 0x0100 + k for k, ch in enumerate(chars)}
+    lines = ["// Test character table for tests/text.esk (codes chosen by gen_test_data.py)."]
+    lines += [f"{code:04X}={ch}" for ch, code in table.items()]
+    lines += ["0300=ab", "// Function codes", "E000=\\n", "25BC=\\r"]
+    with open(os.path.join(DATA, "charmap_test.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return table
+
+
+def pack9(codes, width):
+    """The 9-bit form: 0xF100, the codes and 0x1FF in width-bit units (ones after the
+    end), then 0xFFFF."""
+    bits, n = 0, 0
+    for c in codes + [0x1FF]:
+        bits |= c << n
+        n += 9
+    words = (n + width - 1) // width
+    bits |= ((1 << (words * width)) - 1) ^ ((1 << n) - 1)
+    return [0xF100] + [(bits >> (width * k)) & ((1 << width) - 1) for k in range(words)] + [0xFFFF]
+
+
+def gen_text():
+    """gen4.msg and gen5.msg: messages encrypted as the public descriptions say, with
+    line breaks, page codes, control codes, the 9-bit form and an unknown code; the
+    tests hold the texts they must decode to."""
+    t = gen4_codes()
+
+    def chars(s):
+        return [t[c] for c in s]
+    msgs4 = [
+        chars("Hello, world!"),
+        chars("A") + [0xE000] + chars("B") + [0x25BC] + chars("C") + [0x25BD] + chars("D"),
+        chars("Hi ") + [0xFFFE, 0x0101, 2, 2, 0] + chars(" and ") + [0xFFFE, 0xFF00, 1, 3] + chars("Pokémon!"),
+        "packed",
+        chars("x") + [0x0DFF] + chars("y"),
+        [],
+        [0xFFFE, 0x0200, 0] + chars("¿Sí?") + [0xFFFE, 0x1234, 1, 7],
+    ]
+    seed = 0x4C21
+    words = []
+    for m in msgs4:
+        words.append(pack9(chars("Richi"), 15) if m == "packed" else m + [0xFFFF])
+    n = len(words)
+    table, body = b"", b""
+    at = 4 + 8 * n
+    for i, w in enumerate(words):
+        k = (seed * 0x2FD * (i + 1)) & 0xFFFF
+        k32 = k | k << 16
+        table += u32((at + len(body)) ^ k32) + u32(len(w) ^ k32)
+        key = (0x91BD3 * (i + 1)) & 0xFFFF
+        for c in w:
+            body += u16(c ^ key)
+            key = (key + 0x493D) & 0xFFFF
+    write("gen4.msg", u16(n) + u16(seed) + table + body)
+
+    # Gen 5: two blocks of three entries
+    def g5(s):
+        return [ord(c) for c in s]
+    blocks = [
+        [g5("Bonjour") + [0xFFFE] + g5("le monde"), g5("Ciao ") + [0xF000, 0xBD02, 2, 1, 5] + g5("!"), "packed"],
+        [g5("Ünïcödé ★"), [], [0xF000, 0xBE01, 0] + g5("end")],
+    ]
+    rnd = random.Random(5)
+    data_blocks = []
+    for blk in blocks:
+        entries, strings = b"", b""
+        first = 4 + 8 * len(blk)
+        for m in blk:
+            w = pack9(g5("Jordi"), 16) if m == "packed" else m + [0xFFFF]
+            key = rnd.randrange(0x10000)
+            keys = [0] * len(w)
+            for j in range(len(w) - 1, -1, -1):
+                keys[j] = key
+                key = ((key >> 3) | (key << 13)) & 0xFFFF
+            entries += u32(first + len(strings)) + u16(len(w)) + u16(0)
+            strings += b"".join(u16(c ^ k) for c, k in zip(w, keys))
+        content = entries + strings
+        data_blocks.append(pad(u32(4 + len(content)) + content, 4))
+    head = 12 + 4 * len(blocks)
+    offs, at = [], head
+    for b in data_blocks:
+        offs.append(at)
+        at += len(b)
+    out = u16(len(blocks)) + u16(3) + data_blocks[0][:4] + u32(0) + b"".join(u32(o) for o in offs) + b"".join(data_blocks)
+    write("gen5.msg", out)
+
+
+# ---------------------------------------------------------------------------
 # 3D: NSBTX textures, NSBMD model
 
 def nitro_dict(entries, unit):
@@ -1129,13 +1580,30 @@ def main():
     ref = None
     if "--ref" in sys.argv:
         ref = sys.argv[sys.argv.index("--ref") + 1]
+    only = None
+    if "--only" in sys.argv:
+        only = sys.argv[sys.argv.index("--only") + 1].split(",")
     os.makedirs(DATA, exist_ok=True)
-    gen_sdat(ref)
-    gen_lz()
-    gen_archives()
-    gen_graphics()
-    t = gen_textures()
-    gen_model(t)
+
+    def want(name):
+        return only is None or name in only
+    if want("sdat"):
+        gen_sdat(ref)
+    if want("sdat_arc"):
+        gen_sdat_arc()
+    if want("lz"):
+        gen_lz()
+    if want("archives"):
+        gen_archives()
+    if want("graphics"):
+        gen_graphics()
+    if want("anims"):
+        gen_anims()
+    if want("text"):
+        gen_text()
+    if want("textures") or want("model"):
+        t = gen_textures()
+        gen_model(t)
 
 
 if __name__ == "__main__":

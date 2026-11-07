@@ -10,6 +10,7 @@ import <mem>;
 import <fs>;
 import <string>;
 import <bytes>;
+import <list>;
 import <nds/bin>;
 import <nds/lz>;
 import <nds/narc>;
@@ -19,10 +20,12 @@ import <nds/wav>;
 import <nds/image>;
 import <nds/graphics>;
 import <nds/model>;
+import <nds/text>;
 
 extern int atoi(string s);
 
 int iterations = 150;
+NdsCells the_cells;
 uint32 seed = 11;
 
 uint32 rnd() {
@@ -46,6 +49,20 @@ void try_sdat(*uint8 d, int64 n) {
     for (k in 0..4) {
         Result<SdatWave, string> w = s.wave(0, k);
         if (w.ok) w.value.free();
+    }
+    for (i in 0..s.ssar_count()) {
+        int ne = s.ssar_entries(i);
+        for (k in 0..(ne < 8 ? ne : 8)) {
+            Result<SdatPlayer, string> p = SdatPlayer_open_ssar(&s, i, k, k % 2 == 0);
+            if (!p.ok) continue;
+            int16[2400] buf;
+            p.value.render(&buf[0], 1200);
+            p.value.free();
+        }
+    }
+    for (i in 0..s.strm_count()) {
+        Result<SdatStream, string> st = s.stream(i);
+        if (st.ok) st.value.free();
     }
     s.close();
 }
@@ -105,6 +122,46 @@ void try_2d(*uint8 d, int64 n, NdsTiles* tiles, NdsPalette* pal) {
     }
 }
 
+void try_anim(*uint8 d, int64 n, NdsCells* cells, NdsTiles* tiles, NdsPalette* pal) {
+    Result<NdsAnims, string> a = nanr_read(d, n);
+    if (a.ok) {
+        for (i in 0..a.value.count) {
+            List<NdsImage> imgs;
+            imgs.init(4);
+            a.value.render(i, cells, tiles, pal, &imgs);
+            for (k in 0..imgs.size) imgs.data[k].free();
+            imgs.free();
+            a.value.frame_at(i, 77);
+        }
+    }
+    Result<NdsMultiCells, string> m = nmcr_read(d, n);
+    if (m.ok) {
+        for (i in 0..m.value.count) {
+            if (!a.ok) continue;
+            int x0 = 0;
+            int y0 = 0;
+            int x1 = 0;
+            int y1 = 0;
+            m.value.bounds(i, &a.value, 5, cells, &x0, &y0, &x1, &y1);
+            NdsImage img = NdsImage_new(x1 - x0, y1 - y0);
+            m.value.draw(i, &a.value, 5, cells, tiles, pal, &img, -x0, -y0);
+            img.free();
+        }
+        m.value.free();
+    }
+    if (a.ok) a.value.free();
+}
+
+void try_text(*uint8 d, int64 n) {
+    Result<NdsText, string> t = nds_text_read(d, n, null);
+    if (!t.ok) return;
+    for (i in 0..t.value.count) {
+        string s = t.value.text(i, i % 2);
+        free((*void)s);
+    }
+    t.value.free();
+}
+
 void try_3d(*uint8 d, int64 n) {
     Result<NdsTexSet, string> t = nds_texset(d, n);
     if (t.ok) {
@@ -125,6 +182,8 @@ void try_all(int kind, *uint8 d, int64 n, NdsTiles* tiles, NdsPalette* pal) {
     if (kind == 3) try_lz(d, n);
     if (kind == 4) try_2d(d, n, tiles, pal);
     if (kind == 5) try_3d(d, n);
+    if (kind == 6) try_anim(d, n, &the_cells, tiles, pal);
+    if (kind == 7) try_text(d, n);
 }
 
 NdsData slurp(string name) {
@@ -188,6 +247,13 @@ if (!pr.ok || !tr.ok) {
 
 NdsPalette pal = pr.value;
 NdsTiles tiles = tr.value;
+NdsData cd = slurp("cells.ncer");
+Result<NdsCells, string> cr = ncer_read(cd.data, cd.len);
+if (!cr.ok) {
+    printf("FAIL cannot read the cells\n");
+    return 1;
+}
+the_cells = cr.value;
 file("test.sdat", 0, &tiles, &pal);
 file("plain.narc", 1, &tiles, &pal);
 file("named.narc", 1, &tiles, &pal);
@@ -202,20 +268,31 @@ file("screen.nscr", 4, &tiles, &pal);
 file("cells.ncer", 4, &tiles, &pal);
 file("test.nsbtx", 5, &tiles, &pal);
 file("test.nsbmd", 5, &tiles, &pal);
+file("test_arc.sdat", 0, &tiles, &pal);
+file("anims.nanr", 6, &tiles, &pal);
+file("anims.nmar", 6, &tiles, &pal);
+file("anims.nmcr", 6, &tiles, &pal);
+file("gen4.msg", 7, &tiles, &pal);
+file("gen5.msg", 7, &tiles, &pal);
 // random garbage behind each magic
-string[10] magics = {"SDAT", "NARC", "RLCN", "RGCN", "RCSN", "RECN", "BTX0", "BMD0", "SWAR", "SSEQ"};
+string[15] magics = {"SDAT", "NARC", "RLCN", "RGCN", "RCSN", "RECN", "BTX0", "BMD0", "SWAR", "SSEQ", "RNAN", "RAMN", "RCMN", "SSAR", "STRM"};
 for (it in 0..iterations) {
     int n = (int)(rnd() % 600) + 4;
     *uint8 g = alloc<uint8>((int64)n);
     for (i in 0..n) g[i] = (uint8)rnd();
-    string m = magics[(int)(rnd() % 10)];
+    string m = magics[(int)(rnd() % 15)];
     for (i in 0..4) g[i] = (uint8)m[i];
-    for (kind in 0..6) try_all(kind, g, (int64)n, &tiles, &pal);
+    for (kind in 0..8) try_all(kind, g, (int64)n, &tiles, &pal);
+    NdsData sd = NdsData{data: g, len: (int64)n};
+    Result<SdatStream, string> st = sdat_strm(sd);
+    if (st.ok) st.value.free();
     free((*void)g);
 }
 
 pal.free();
 tiles.free();
+the_cells.free();
+free((*void)cd.data);
 free((*void)pd.data);
 free((*void)td.data);
 printf("corrupt: ok\n");
