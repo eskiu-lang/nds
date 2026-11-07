@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/eskiu-lang/nds/actions/workflows/ci.yml"><img src="https://github.com/eskiu-lang/nds/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.1.0-6448d4" alt="Version 0.1.0">
+  <img src="https://img.shields.io/badge/version-0.2.0-6448d4" alt="Version 0.2.0">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
 
@@ -253,7 +253,7 @@ Android arm64 emulator.
 
 ```toml
 [deps]
-nds = { git = "https://github.com/eskiu-lang/nds", rev = "v0.1.0" }
+nds = { git = "https://github.com/eskiu-lang/nds", rev = "v0.2.0" }
 ```
 
 ```
