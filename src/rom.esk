@@ -19,6 +19,8 @@ import <nds/bin>;
 import <nds/narc>;
 import <nds/lz>;
 
+// An ARM9 overlay from the ROM's table: its id, where it loads in RAM and its size there,
+// the size of its zeroed BSS, its FAT file id, and whether the file is BLZ-compressed.
 struct NdsOverlay {
     int id;
     int64 ram;
@@ -28,6 +30,10 @@ struct NdsOverlay {
     bool compressed;
 }
 
+// A DS ROM: the header fields (title, game code, maker code, unit, version, the ARM9 and
+// ARM7 binaries' offsets, entries, load addresses and sizes, the banner's offset), the
+// files of its FAT and their names, and the ARM9 overlays. Made by NdsRom_open or
+// NdsRom_from; free it with close().
 struct NdsRom {
     NdsData d;
     bool owned;
@@ -53,6 +59,8 @@ struct NdsRom {
     *NdsOverlay overlays;
 }
 
+// Reads a ROM held in memory; the ROM and its file views point into `data`, which must
+// outlive it. Err when it is too short for a header or its FNT or FAT is out of range.
 Result<NdsRom, string> NdsRom_from(*uint8 data, int64 len) {
     let r: NdsRom;
     r.d = NdsData{data: data, len: len};
@@ -105,6 +113,8 @@ Result<NdsRom, string> NdsRom_from(*uint8 data, int64 len) {
     return Ok<NdsRom, string>(r);
 }
 
+// Reads a ROM file; the ROM owns its bytes and close() frees them. Err when the file
+// cannot be read or is not a valid ROM.
 Result<NdsRom, string> NdsRom_open(string path) {
     int64 n = 0;
     *uint8 p = fs_read_all(path, &n);
@@ -118,6 +128,8 @@ Result<NdsRom, string> NdsRom_open(string path) {
     return r;
 }
 
+// Frees the ROM (and its bytes when it read them from a file); views into it are no longer
+// valid.
 void NdsRom_close(NdsRom* self) {
     if (self.title != null) free((*void)self.title);
     if (self.code != null) free((*void)self.code);
@@ -139,6 +151,7 @@ void NdsRom_close(NdsRom* self) {
     self.owned = false;
 }
 
+// The number of files in the FAT.
 int NdsRom_count(NdsRom* self) {
     return self.nfiles;
 }
@@ -155,10 +168,12 @@ string NdsRom_name(NdsRom* self, int id) {
     return self.names.names[id];
 }
 
+// The file id of path ("a/0/0/4", no leading slash), or -1.
 int NdsRom_find(NdsRom* self, string path) {
     return self.names.find(path);
 }
 
+// The file at path as a view into the ROM; empty when there is none.
 NdsData NdsRom_file_path(NdsRom* self, string path) {
     return self.file(self.find(path));
 }

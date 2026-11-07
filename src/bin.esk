@@ -16,6 +16,7 @@ struct NdsData {
     int64 len;
 }
 
+// A view of the `len` bytes at `data` (not copied, not freed).
 NdsData nds_data(*uint8 data, int64 len) {
     return NdsData{data: data, len: len};
 }
@@ -25,26 +26,31 @@ bool NdsData_has(NdsData* self, int64 off, int64 n) {
     return off >= 0 && n >= 0 && off <= self.len && n <= self.len - off;
 }
 
+// The byte at off, or 0 past the end.
 int NdsData_u8(NdsData* self, int64 off) {
     if (!self.has(off, 1)) return 0;
     return (int)self.data[off];
 }
 
+// The little-endian uint16 at off, or 0 past the end.
 int NdsData_u16(NdsData* self, int64 off) {
     if (!self.has(off, 2)) return 0;
     return (int)self.data[off] | ((int)self.data[off + 1] << 8);
 }
 
+// The little-endian int16 at off, sign-extended, or 0 past the end.
 int NdsData_s16(NdsData* self, int64 off) {
     return (int)(int16)(uint16)self.u16(off);
 }
 
+// The little-endian uint32 at off, or 0 past the end.
 int64 NdsData_u32(NdsData* self, int64 off) {
     if (!self.has(off, 4)) return 0;
     *uint8 p = self.data + off;
     return (int64)p[0] | ((int64)p[1] << 8) | ((int64)p[2] << 16) | ((int64)p[3] << 24);
 }
 
+// The little-endian int32 at off, or 0 past the end.
 int NdsData_s32(NdsData* self, int64 off) {
     return (int)(uint32)self.u32(off);
 }

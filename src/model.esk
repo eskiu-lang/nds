@@ -79,6 +79,8 @@ int64 nds_block(NdsData* d, string magic) {
 
 // ---- textures ----
 
+// Texture formats (NdsTexture.format): A3I5 translucent, 4-color, 16-color and 256-color
+// paletted, 4x4 compressed, A5I3 translucent, and direct 15-bit color.
 const int NDS_TEX_A3I5 = 1;
 const int NDS_TEX_4 = 2;
 const int NDS_TEX_16 = 3;
@@ -87,6 +89,9 @@ const int NDS_TEX_4X4 = 5;
 const int NDS_TEX_A5I3 = 6;
 const int NDS_TEX_DIRECT = 7;
 
+// A texture of a TEX0 block: its name, format (NDS_TEX_*), size in texels, the offset of
+// its data (from the set's texture data, or the compressed data for NDS_TEX_4X4), whether
+// palette color 0 is transparent, and its repeat and flip flags along s and t.
 struct NdsTexture {
     string name;
     int format;
@@ -100,11 +105,16 @@ struct NdsTexture {
     bool flip_t;
 }
 
+// A palette of a TEX0 block: its name and the offset of its colors in the set's palette
+// data.
 struct NdsTexPalette {
     string name;
     int64 offset;
 }
 
+// The textures and palettes of a TEX0 block (in an NSBTX or an NSBMD), with where their
+// data is. The data stays in the file's buffer, which must outlive the set. Free with
+// free().
 struct NdsTexSet {
     NdsData d;
     int64 tex_data;
@@ -118,6 +128,7 @@ struct NdsTexSet {
     *NdsTexPalette pal;
 }
 
+// Frees the texture and palette tables and their names.
 void NdsTexSet_free(NdsTexSet* self) {
     if (self.tex != null) {
         for (i in 0..self.ntex) free((*void)self.tex[i].name);
@@ -198,6 +209,7 @@ Result<NdsTexSet, string> nds_texset(*uint8 data, int64 len) {
     return Ok<NdsTexSet, string>(ts);
 }
 
+// The index of the texture named name, or -1.
 int NdsTexSet_find(NdsTexSet* self, string name) {
     for (i in 0..self.ntex) {
         if (strcmp(self.tex[i].name, name) == 0) return i;
@@ -205,6 +217,7 @@ int NdsTexSet_find(NdsTexSet* self, string name) {
     return -1;
 }
 
+// The index of the palette named name, or -1.
 int NdsTexSet_find_palette(NdsTexSet* self, string name) {
     for (i in 0..self.npal) {
         if (strcmp(self.pal[i].name, name) == 0) return i;
@@ -360,6 +373,7 @@ Result<NdsImage, string> NdsTexSet_image(NdsTexSet* self, int tex, int pal) {
 
 // ---- models (NSBMD) ----
 
+// A vertex of a mesh: position, texture coordinates in texels, normal and color (0 to 1).
 struct NdsVertex {
     float x;
     float y;
@@ -383,12 +397,16 @@ struct NdsMeshGroup {
     bool has_colors;
 }
 
+// A material of a model: its name, and the names of its texture and palette (null when it
+// has none).
 struct NdsMaterial {
     string name;
     string texture;
     string palette;
 }
 
+// A model of an NSBMD: its name, the scale its positions were multiplied by, its
+// materials, and its triangles grouped by material. Free with free().
 struct NdsModel {
     string name;
     float scale;
@@ -397,6 +415,7 @@ struct NdsModel {
     List<NdsMeshGroup> groups;
 }
 
+// Frees the model's names, materials and meshes.
 void NdsModel_free(NdsModel* self) {
     if (self.name != null) free((*void)self.name);
     self.name = null;

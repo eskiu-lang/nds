@@ -17,6 +17,7 @@ struct Pcm16 {
     int rate;
 }
 
+// Frees the samples and empties the buffer.
 void Pcm16_free(Pcm16* self) {
     if (self.data != null) free((*void)self.data);
     self.data = null;
@@ -54,10 +55,12 @@ Bytes wav_bytes(*int16 data, int64 frames, int channels, int rate) {
     return b;
 }
 
+// The buffer as a WAV file in memory (wav_bytes); the caller frees it.
 Bytes Pcm16_wav_bytes(Pcm16* self) {
     return wav_bytes(self.data, self.frames, self.channels, self.rate);
 }
 
+// Writes the buffer to path as a WAV file; Err when the file cannot be written.
 Result<int, string> Pcm16_write_wav(Pcm16* self, string path) {
     Bytes b = self.wav_bytes();
     int ok = fs_write_all(path, b.data, b.len);

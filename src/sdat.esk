@@ -50,6 +50,7 @@ extern float __exp10f(float x);
 extern float powf(float x, float y);
 #endif
 
+// The sample rate the sequence renderer writes, in Hz.
 const int SDAT_RATE = 48000;
 const int _SD_AMPL_MIN = -92544;
 const int _SD_MAX_VOICES = 32;
@@ -80,6 +81,9 @@ struct _SdStrmInfo {
     int vol;
 }
 
+// An SDAT sound archive: its files, the INFO records of its sequences, sequence archives,
+// streams, banks and wave archives, and their SYMB names. Made by Sdat_open or Sdat_from;
+// free it with close().
 struct Sdat {
     NdsData d;
     bool owned;
@@ -116,6 +120,7 @@ struct SdatWave {
     int64 loop_start;
 }
 
+// Frees the samples.
 void SdatWave_free(SdatWave* self) {
     if (self.pcm != null) free((*void)self.pcm);
     self.pcm = null;
@@ -282,6 +287,7 @@ void _sd_ssar_names(Sdat* s, int64 symb) {
     }
 }
 
+// Frees the archive (and its bytes when it read them from a file).
 void Sdat_close(Sdat* self) {
     if (self.files != null) free((*void)self.files);
     if (self.seqs != null) free((*void)self.seqs);
@@ -355,15 +361,18 @@ int Sdat_seq_find(Sdat* self, string name) {
     return _sd_find(self.seq_names, self.nseq_names, name);
 }
 
+// Wave archive slots in the INFO block (some may be empty).
 int Sdat_wavearc_count(Sdat* self) {
     return self.nwavearcs;
 }
 
+// The SYMB name of wave archive i, or null.
 string Sdat_wavearc_name(Sdat* self, int i) {
     if (i < 0 || i >= self.nwavearc_names) return null;
     return self.wavearc_names[i];
 }
 
+// The index of the wave archive named name, or -1 (the last one when two share it).
 int Sdat_wavearc_find(Sdat* self, string name) {
     return _sd_find(self.wavearc_names, self.nwavearc_names, name);
 }
@@ -496,6 +505,7 @@ struct SdatStream {
     int vol;
 }
 
+// Frees the stream's samples.
 void SdatStream_free(SdatStream* self) {
     self.pcm.free();
 }
@@ -573,11 +583,13 @@ int Sdat_strm_count(Sdat* self) {
     return self.nstrms;
 }
 
+// The SYMB name of stream i, or null.
 string Sdat_strm_name(Sdat* self, int i) {
     if (i < 0 || i >= self.nstrm_names) return null;
     return self.strm_names[i];
 }
 
+// The index of the stream named name, or -1 (the last one when two share it).
 int Sdat_strm_find(Sdat* self, string name) {
     return _sd_find(self.strm_names, self.nstrm_names, name);
 }
@@ -939,6 +951,7 @@ string Sdat_ssar_name(Sdat* self, int i) {
     return self.ssar_names[i];
 }
 
+// The index of the sequence archive named name, or -1 (the last one when two share it).
 int Sdat_ssar_find(Sdat* self, string name) {
     return _sd_find(self.ssar_names, self.nssar_names, name);
 }
@@ -997,6 +1010,7 @@ Result<SdatPlayer, string> SdatPlayer_open_ssar(Sdat* sdat, int i, int k, bool l
     return _sd_player(sdat, f, e.offset, e.bank, e.vol, looping);
 }
 
+// Frees the player's sequence copy, bank and tracks; it is done afterwards.
 void SdatPlayer_free(SdatPlayer* self) {
     if (self.seq != null) free((*void)self.seq);
     self.seq = null;
@@ -1006,6 +1020,7 @@ void SdatPlayer_free(SdatPlayer* self) {
     self.done = true;
 }
 
+// Whether the sequence has ended.
 bool SdatPlayer_is_done(SdatPlayer* self) {
     return self.done;
 }
@@ -1583,6 +1598,7 @@ Result<int64, string> Sdat_render(Sdat* self, int seq, double seconds, Pcm16* ou
     return Ok<int64, string>(out.frames);
 }
 
+// Sdat_render for the sequence named name; Err (with `out` empty) when there is none.
 Result<int64, string> Sdat_render_name(Sdat* self, string name, double seconds, Pcm16* out) {
     int i = self.seq_find(name);
     if (i < 0) {

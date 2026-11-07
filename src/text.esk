@@ -60,6 +60,8 @@ struct NdsTextItem {
     int nargs;
 }
 
+// One message of an NdsText: its items are items[first .. first + count); `compressed` is
+// set for a Gen 4 message stored in the 9-bit compressed form.
 struct NdsMessage {
     int first;
     int count;
@@ -88,6 +90,7 @@ struct NdsCharmap {
     *int chars;
 }
 
+// Frees the table and empties it.
 void NdsCharmap_free(NdsCharmap* self) {
     if (self.chars != null) free((*void)self.chars);
     self.chars = null;
@@ -157,6 +160,8 @@ Result<NdsCharmap, string> nds_charmap_read(*uint8 data, int64 len) {
     return Ok<NdsCharmap, string>(NdsCharmap{count: top, chars: chars});
 }
 
+// Reads a character table file (as nds_charmap_read) from path; Err when the file cannot
+// be read or a line is malformed.
 Result<NdsCharmap, string> nds_charmap_load(string path) {
     NdsData d = nds_read_file(path)?;
     Result<NdsCharmap, string> r = nds_charmap_read(d.data, d.len);
@@ -164,6 +169,7 @@ Result<NdsCharmap, string> nds_charmap_load(string path) {
     return r;
 }
 
+// Frees the messages and their items.
 void NdsText_free(NdsText* self) {
     if (self.msgs != null) free((*void)self.msgs);
     if (self.items.data != null) List_free<NdsTextItem>(&self.items);

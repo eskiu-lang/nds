@@ -46,11 +46,14 @@ int64 nds_section(NdsData* d, string magic) {
     return -1;
 }
 
+// Colors as 8-bit RGB, 3 bytes per color (`count` colors), converted from the DS's 15-bit
+// BGR555. Free with free().
 struct NdsPalette {
     int count;
     *uint8 rgb;
 }
 
+// Frees the colors and empties the palette.
 void NdsPalette_free(NdsPalette* self) {
     if (self.rgb != null) free((*void)self.rgb);
     self.rgb = null;
@@ -95,6 +98,9 @@ Result<NdsPalette, string> nclr_read(*uint8 data, int64 len) {
     return Ok<NdsPalette, string>(nds_palette_bgr555(data + start, (int)(size / 2)));
 }
 
+// Character data from an NCGR: `bpp` 4 or 8, `count` tiles of 8x8 color indices in `pix`
+// (see ncgr_read), the size in tiles when the file gives one (else -1), and `linear` for a
+// bitmap stored row by row. Free with free().
 struct NdsTiles {
     int bpp;
     int count;
@@ -104,6 +110,7 @@ struct NdsTiles {
     bool linear;
 }
 
+// Frees the pixels.
 void NdsTiles_free(NdsTiles* self) {
     if (self.pix != null) free((*void)self.pix);
     self.pix = null;
@@ -196,6 +203,8 @@ NdsImage NdsTiles_sheet(NdsTiles* self, NdsPalette* pal, int cols, int palno) {
     return img;
 }
 
+// A screen map from an NSCR: its size in pixels and `count` 16-bit entries, one per 8x8
+// cell (see nscr_read). Free with free().
 struct NdsScreen {
     int width;
     int height;
@@ -203,6 +212,7 @@ struct NdsScreen {
     *uint16 entries;
 }
 
+// Frees the entries.
 void NdsScreen_free(NdsScreen* self) {
     if (self.entries != null) free((*void)self.entries);
     self.entries = null;
@@ -279,6 +289,8 @@ struct NdsOam {
     bool bpp8;
 }
 
+// The cells of an NCER: cell i is the objects oams[first[i] .. first[i] + n[i]) (read them
+// with oam()), and `mapping` the tile mapping (see ncer_read). Free with free().
 struct NdsCells {
     int count;
     *int first;
@@ -287,6 +299,7 @@ struct NdsCells {
     int mapping;
 }
 
+// Frees the cells and their objects.
 void NdsCells_free(NdsCells* self) {
     if (self.first != null) free((*void)self.first);
     if (self.n != null) free((*void)self.n);
@@ -364,6 +377,7 @@ Result<NdsCells, string> ncer_read(*uint8 data, int64 len) {
     return Ok<NdsCells, string>(c);
 }
 
+// Object k of cell `cell` (no bounds check: k must be below n[cell]).
 NdsOam* NdsCells_oam(NdsCells* self, int cell, int k) {
     return &self.oams.data[self.first[cell] + k];
 }
@@ -473,12 +487,15 @@ struct NdsAnimSeq {
     int count;
 }
 
+// The sequences of an NANR or NMAR: sequence i is seqs[i], its frames frames[first ..
+// first + count). Free with free().
 struct NdsAnims {
     int count;
     *NdsAnimSeq seqs;
     List<NdsAnimFrame> frames;
 }
 
+// Frees the sequences and their frames.
 void NdsAnims_free(NdsAnims* self) {
     if (self.seqs != null) free((*void)self.seqs);
     if (self.frames.data != null) List_free<NdsAnimFrame>(&self.frames);
@@ -752,6 +769,8 @@ struct NdsMcNode {
     int anim;
 }
 
+// The multi-cells of an NMCR: multi-cell i has n[i] nodes from nodes[first[i]] (read them
+// with node()) and uses nanims[i] animation slots. Free with free().
 struct NdsMultiCells {
     int count;
     *int first;
@@ -760,6 +779,7 @@ struct NdsMultiCells {
     List<NdsMcNode> nodes;
 }
 
+// Frees the multi-cells and their nodes.
 void NdsMultiCells_free(NdsMultiCells* self) {
     if (self.first != null) free((*void)self.first);
     if (self.n != null) free((*void)self.n);
@@ -808,6 +828,7 @@ Result<NdsMultiCells, string> nmcr_read(*uint8 data, int64 len) {
     return Ok<NdsMultiCells, string>(m);
 }
 
+// Node k of multi-cell mc (no bounds check: k must be below n[mc]).
 NdsMcNode* NdsMultiCells_node(NdsMultiCells* self, int mc, int k) {
     return &self.nodes.data[self.first[mc] + k];
 }

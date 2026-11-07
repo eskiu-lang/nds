@@ -10,6 +10,8 @@ import <mem>;
 import <bytes>;
 import <result>;
 
+// The largest output a decompressor makes, in bytes (64 MB); data that says more is an
+// error.
 const int64 NDS_LZ_LIMIT = 64 << 20;
 
 // True when the data starts like LZ10 or LZ11 data.
@@ -17,6 +19,9 @@ bool nds_is_lz(*uint8 data, int64 len) {
     return len >= 4 && (data[0] == 0x10 || data[0] == 0x11);
 }
 
+// Decompresses DS BIOS LZ10 (type byte 0x10) or LZ11 (0x11) data; Err for another type,
+// truncated data, a back reference before the start, or an output over NDS_LZ_LIMIT. The
+// Bytes are the caller's to free.
 Result<Bytes, string> nds_lz_decompress(*uint8 d, int64 len) {
     if (len < 4) return Err<Bytes, string>("lz: truncated");
     int t = (int)d[0];

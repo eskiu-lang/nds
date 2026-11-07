@@ -25,6 +25,7 @@ struct NdsNames {
     *string names;
 }
 
+// Frees the names and empties the table.
 void NdsNames_free(NdsNames* self) {
     if (self.names != null) {
         for (i in 0..self.count) {
@@ -118,6 +119,8 @@ Result<NdsNames, string> nds_names(NdsData d, int64 fnt, int nfiles) {
     return Ok<NdsNames, string>(n);
 }
 
+// A NARC archive: its files, by index and, when it has a name table, by path. Made by
+// Narc_open or Narc_from; free it with close().
 struct Narc {
     NdsData d;
     bool owned;
@@ -129,6 +132,8 @@ struct Narc {
     NdsNames names;
 }
 
+// Reads a NARC held in memory; the archive and its file views point into `data`, which
+// must outlive it. Err when it is not a NARC or a block is out of range.
 Result<Narc, string> Narc_from(*uint8 data, int64 len) {
     let n: Narc;
     n.d = NdsData{data: data, len: len};
@@ -170,6 +175,8 @@ Result<Narc, string> Narc_from(*uint8 data, int64 len) {
     return Ok<Narc, string>(n);
 }
 
+// Reads a NARC file; the archive owns its bytes and close() frees them. Err when the file
+// cannot be read or is not a valid NARC.
 Result<Narc, string> Narc_open(string path) {
     int64 n = 0;
     *uint8 p = fs_read_all(path, &n);
@@ -183,6 +190,8 @@ Result<Narc, string> Narc_open(string path) {
     return r;
 }
 
+// Frees the archive (and its bytes when it read them from a file); views into it are no
+// longer valid.
 void Narc_close(Narc* self) {
     if (self.starts != null) free((*void)self.starts);
     if (self.ends != null) free((*void)self.ends);
@@ -195,6 +204,7 @@ void Narc_close(Narc* self) {
     self.owned = false;
 }
 
+// The number of files.
 int Narc_count(Narc* self) {
     return self.nfiles;
 }
