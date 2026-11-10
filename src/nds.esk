@@ -6,8 +6,9 @@
 // NARC archives, <nds/rom> ROM headers, file systems and overlays,
 // <nds/sdat> sound archives and their synthesizer, <nds/wav> WAV files,
 // <nds/image> RGBA images and PNG, <nds/graphics> 2D graphics and cell
-// animations, <nds/model> 3D textures and models, <nds/text> Gen 4 and Gen 5
-// message files.
+// animations, <nds/model> 3D textures and models, <nds/anim> 3D
+// animations, <nds/gltf> the glTF writer, <nds/spl> SPL particles,
+// <nds/text> Gen 4 and Gen 5 message files.
 
 import <nds/bin>;
 import <nds/lz>;
@@ -18,4 +19,7 @@ import <nds/wav>;
 import <nds/image>;
 import <nds/graphics>;
 import <nds/model>;
+import <nds/anim>;
+import <nds/gltf>;
+import <nds/spl>;
 import <nds/text>;
