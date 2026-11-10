@@ -3,7 +3,7 @@
 </p>
 
 <h2 align="center">nds</h2>
-<p align="center">Nintendo DS file formats for Eskiu: ROMs, NARC archives, sound, 2D graphics, 3D textures and game text.</p>
+<p align="center">Nintendo DS file formats for Eskiu: ROMs, NARC archives, sound, 2D graphics, 3D models and particles, and game text.</p>
 <p align="center"><sub>Part of the <a href="https://github.com/eskiu-lang">Eskiu</a> project</sub></p>
 <p align="center">
   <a href="https://eskiu-lang.org">eskiu-lang.org</a> &nbsp;&middot;&nbsp;
@@ -25,7 +25,9 @@ the standard library. It was ported from the tools and engine of Tallgrass, a ga
 that loads the assets of DS games, and checked against them on the files of three
 games. The cell animation, sequence archive, stream and text readers were written later
 from public format descriptions (see [Sources](docs/checks.md#sources)) and checked against the same
-tools as black boxes.
+tools as black boxes. The skinned models, their animations and the glTF writer were
+checked against apicula, and the particle reader, worked out from the games' files,
+against the Tallgrass engine's converter.
 
 - **ROMs and archives.** A `.nds` ROM's header, its file system by path or id and its
   ARM9 overlays; NARC archives by index or path; LZ10, LZ11 and the backward LZ of
@@ -39,8 +41,12 @@ tools as black boxes.
   durations, translation, rotation and scale) and NMCR multi-cells, drawn frame by frame.
 - **Text.** The message files of the Gen 4 and Gen 5 Pokémon games, decrypted, with
   their control codes kept as tagged items.
-- **3D.** NSBTX and NSBMD textures in all seven DS formats, and the triangles of NSBMD
-  models grouped by material.
+- **3D.** NSBTX and NSBMD textures in all seven DS formats; NSBMD models posed as the
+  DS draws them, with node matrices, the matrix stack and skinning; joint, texture SRT,
+  texture pattern and material color animations (BCA, BTA, BTP, BMA); and a glTF 2.0
+  writer with skins, materials, textures and animations.
+- **Particles.** SPL archives (.spa): emitters, their animations, child particles,
+  fields and textures, written in the open particle format of the Tallgrass engine.
 - **PNG and WAV writers**, so the examples need nothing else.
 - **Errors as `Result`.** Every read is bounds checked; truncated or corrupt files give an
   error, never a crash (the parsers run under AddressSanitizer with mutated inputs).
@@ -67,6 +73,8 @@ Result<int, string> run() {
 - [Sound](docs/sound.md): rendering sequences, players, sound effects of sequence archives,
 - [Archives and ROMs](docs/archives.md): ROM files and overlays, NARCs, LZ
 - [Graphics and textures](docs/graphics.md): palettes, tiles, screens, cells, animations,
+- [Models, animations and particles](docs/models.md): skinned meshes, BCA, BTA, BTP and
+  BMA animations, glTF, SPL particles
 - [Text](docs/text.md): Gen 4 and Gen 5 message files and character tables
 - [How it was checked](docs/checks.md): the comparisons on three games' files, and the
 - [API reference](docs/api.md): every public function and type

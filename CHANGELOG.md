@@ -12,9 +12,34 @@ All notable changes to this package are documented here. The format follows
   no per-sample end-of-wave checks where a voice cannot reach its end. The output is
   unchanged, sample for sample, in any block size; rendering takes about 30% less time
   (19.6 against 27.5 ns a frame on Black 2's battle themes on an Apple M-series Mac).
+- `<nds/model>`: `nsbmd_read` reads the model's nodes, inverse bind matrices and the
+  drawing state of its materials (colors, alpha, culling, texture flags and matrix)
+  along with the triangles it gave before; `NdsMaterial` and `NdsModel` have new
+  fields. The test model has three nodes, a skinning blend and full material records.
 
 ### Added
 
+- `<nds/model>`: `nsbmd_open` and `nsbmd_count` for every model of a file;
+  `NdsModel_mesh`, the model posed as the DS draws it (node matrices, the matrix stack,
+  skinning, scale commands) with a joint tree built from the matrix chains and up to
+  four joints and weights a vertex (`NdsMesh`, `NdsJoint`, `NdsMeshVertex`,
+  `NdsPrim`); `NdsNode`, `NdsMat` and the matrix helpers (`nds_mat_*`,
+  `nds_pivot_matrix`, `nds_basis_matrix`).
+- `<nds/anim>`: BCA joint, BTA texture SRT, BTP texture pattern and BMA material color
+  animations (`nds_anim_read`, `NdsAnimFile`), as curves sampled every 1, 2 or 4 frames
+  and read at any frame (`NdsCurve`).
+- `<nds/gltf>`: `nds_gltf_write`, a model to glTF 2.0 with its skin, unlit materials,
+  PNG textures and joint animations; texture SRT and color animations as
+  `KHR_animation_pointer` channels and, with pattern animations, in the JSON side files
+  the Tallgrass engine reads (`.uvanims.json`, `.patterns.json`, `.matanims.json`).
+- `<nds/spl>`: SPL particle archives (`spl_read`, `NdsSpl`): emitters, scale, color,
+  alpha and texture animations, child particles, fields and textures; `NdsSpl_json` and
+  `NdsSpl_write_json` write the Tallgrass engine's open particle format.
+- Tools: `nitro_gltf.esk` with `compare_gltf.py` (against apicula), `spl_json.esk`
+  with `compare_spl.py` (against the Tallgrass engine's converter).
+- Tests: `anim3d`, `gltf` and `spl`, with synthetic BCA, BTA, BTP, BMA and SPA files;
+  the new readers in the `corrupt` test.
+- Docs: `models.md`.
 - Tools: `bench_sdat.py` with `sdat_bench.esk` and `sdat_bench.rs`, which time the
   synthesizer against the Tallgrass engine's on the same sequences and compare a hash
   of both outputs.
