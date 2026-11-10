@@ -20,6 +20,8 @@ import <nds/wav>;
 import <nds/image>;
 import <nds/graphics>;
 import <nds/model>;
+import <nds/anim>;
+import <nds/spl>;
 import <nds/text>;
 
 extern int atoi(string s);
@@ -172,7 +174,49 @@ void try_3d(*uint8 d, int64 n) {
         t.value.free();
     }
     Result<NdsModel, string> m = nsbmd_read(d, n);
-    if (m.ok) m.value.free();
+    if (m.ok) {
+        Result<NdsMesh, string> me = m.value.mesh();
+        if (me.ok) me.value.free();
+        m.value.free();
+    }
+}
+
+void try_3d_anim(*uint8 d, int64 n) {
+    Result<NdsAnimFile, string> r = nds_anim_read(d, n);
+    if (!r.ok) return;
+    NdsAnimFile a = r.value;
+    double[9] v;
+    for (i in 0..a.joint.size) {
+        for (k in 0..a.joint.data[i].ntracks) {
+            NdsJointTrack* t = &a.joint.data[i].tracks[k];
+            t.t_at(3.5, &v[0]);
+            t.r.at(3.5, &v[0]);
+        }
+    }
+    for (i in 0..a.srt.size) {
+        for (k in 0..a.srt.data[i].ntracks) a.srt.data[i].tracks[k].rot.at(2.0, &v[0]);
+    }
+    for (i in 0..a.pattern.size) {
+        for (k in 0..a.pattern.data[i].ntracks) a.pattern.data[i].tracks[k].key_at(5);
+    }
+    for (i in 0..a.color.size) {
+        for (k in 0..a.color.data[i].ntracks) a.color.data[i].tracks[k].diffuse.at(1.0, &v[0]);
+    }
+    a.free();
+}
+
+void try_spl(*uint8 d, int64 n) {
+    Result<NdsSpl, string> r = spl_read(d, n);
+    if (!r.ok) return;
+    for (i in 0..r.value.ntex) {
+        Result<NdsImage, string> img = r.value.image(i);
+        if (img.ok) img.value.free();
+    }
+    let j: String;
+    j.init(256);
+    r.value.json("x", &j);
+    j.free();
+    r.value.free();
 }
 
 void try_all(int kind, *uint8 d, int64 n, NdsTiles* tiles, NdsPalette* pal) {
@@ -184,6 +228,8 @@ void try_all(int kind, *uint8 d, int64 n, NdsTiles* tiles, NdsPalette* pal) {
     if (kind == 5) try_3d(d, n);
     if (kind == 6) try_anim(d, n, &the_cells, tiles, pal);
     if (kind == 7) try_text(d, n);
+    if (kind == 8) try_3d_anim(d, n);
+    if (kind == 9) try_spl(d, n);
 }
 
 NdsData slurp(string name) {
@@ -274,15 +320,20 @@ file("anims.nmar", 6, &tiles, &pal);
 file("anims.nmcr", 6, &tiles, &pal);
 file("gen4.msg", 7, &tiles, &pal);
 file("gen5.msg", 7, &tiles, &pal);
+file("test.nsbca", 8, &tiles, &pal);
+file("test.nsbta", 8, &tiles, &pal);
+file("test.nsbtp", 8, &tiles, &pal);
+file("test.nsbma", 8, &tiles, &pal);
+file("test.spa", 9, &tiles, &pal);
 // random garbage behind each magic
-string[15] magics = {"SDAT", "NARC", "RLCN", "RGCN", "RCSN", "RECN", "BTX0", "BMD0", "SWAR", "SSEQ", "RNAN", "RAMN", "RCMN", "SSAR", "STRM"};
+string[20] magics = {"SDAT", "NARC", "RLCN", "RGCN", "RCSN", "RECN", "BTX0", "BMD0", "SWAR", "SSEQ", "RNAN", "RAMN", "RCMN", "SSAR", "STRM", "BCA0", "BTA0", "BTP0", "BMA0", " APS"};
 for (it in 0..iterations) {
     int n = (int)(rnd() % 600) + 4;
     *uint8 g = alloc<uint8>((int64)n);
     for (i in 0..n) g[i] = (uint8)rnd();
-    string m = magics[(int)(rnd() % 15)];
+    string m = magics[(int)(rnd() % 20)];
     for (i in 0..4) g[i] = (uint8)m[i];
-    for (kind in 0..8) try_all(kind, g, (int64)n, &tiles, &pal);
+    for (kind in 0..10) try_all(kind, g, (int64)n, &tiles, &pal);
     NdsData sd = NdsData{data: g, len: (int64)n};
     Result<SdatStream, string> st = sdat_strm(sd);
     if (st.ok) st.value.free();
