@@ -1,0 +1,101 @@
+// Times the synthesizer of <nds/sdat> for tools/bench_sdat.py:
+//
+//     sdat_bench SDAT SECONDS RUNS NAME...
+//
+// The same harness as tools/sdat_bench.rs, the Tallgrass engine's side: each
+// sequence plays looping for SECONDS, in blocks of 4096 frames into one reused
+// buffer, with no file output. Only the render calls are timed. Each line
+// gives the best of RUNS renders and a hash of the 16-bit samples, so the two
+// programs' output can be compared without writing it.
+import <io>;
+import <mem>;
+import <time>;
+import <nds/sdat>;
+
+extern double atof(string s);
+extern int atoi(string s);
+
+#ifdef __APPLE__
+#define BENCH_CLOCK 6
+#else
+#define BENCH_CLOCK 1
+#endif
+
+const int64 BLOCK = 4096;
+
+int64 now_ns() {
+    let ts: timespec;
+    clock_gettime(BENCH_CLOCK, &ts);
+    return ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+Result<int, string> bench(int n, *string a) {
+    Sdat s = Sdat_open(a[1])?;
+    defer s.close();
+    double seconds = atof(a[2]);
+    int runs = atoi(a[3]);
+    if (runs < 1) runs = 1;
+    int64 frames = (int64)(48000.0 * seconds);
+    *float buf = alloc<float>(BLOCK * 2);
+    defer free((*void)buf);
+    int64 total_frames = 0;
+    int64 total_ns = 0;
+    for (k in 4..n) {
+        string name = a[k];
+        int seq = s.seq_find(name);
+        if (seq < 0) {
+            printf("%s missing\n", name);
+            continue;
+        }
+        int64 best = -1;
+        int64 done = 0;
+        uint64 hash = 0;
+        bool ok = true;
+        for (run in 0..runs) {
+            Result<SdatPlayer, string> r = SdatPlayer_open(&s, seq, true);
+            if (!r.ok) {
+                printf("%s missing\n", name);
+                ok = false;
+                break;
+            }
+            SdatPlayer p = r.value;
+            int64 got_all = 0;
+            int64 ns = 0;
+            uint64 h = 0xcbf29ce484222325;
+            while (got_all < frames) {
+                int64 want = frames - got_all;
+                if (want > BLOCK) want = BLOCK;
+                int64 t = now_ns();
+                int64 got = p.render_f32(buf, want);
+                ns += now_ns() - t;
+                for (int64 i = 0; i < got * 2; i++) {
+                    uint16 v = (uint16)(int16)(buf[i] * (float)32767.0);
+                    h = (h ^ (uint64)v) * 0x100000001b3;
+                }
+                got_all += got;
+                if (got < want) break;
+            }
+            p.free();
+            if (best < 0 || ns < best) best = ns;
+            done = got_all;
+            hash = h;
+        }
+        if (!ok) continue;
+        printf("%s frames %lld ms %.1f hash %016llx\n", name, done, (double)best / 1e6, hash);
+        total_frames += done;
+        total_ns += best;
+    }
+    printf("total frames %lld ms %.1f\n", total_frames, (double)total_ns / 1e6);
+    return Ok<int, string>(0);
+}
+
+if (argc < 5) {
+    printf("usage: sdat_bench SDAT SECONDS RUNS NAME...\n");
+    return 1;
+}
+Result<int, string> r = bench(argc, argv);
+if (!r.ok) {
+    printf("error: %s\n", r.error);
+    return 1;
+}
+return 0;

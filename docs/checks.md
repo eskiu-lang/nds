@@ -34,6 +34,26 @@ expected audio for them was rendered by the Tallgrass engine. On macOS the rende
 match exactly; elsewhere the C library's `exp2`, `powf`, `log10` and `sin` may round a
 last bit differently, so the tests allow a difference of 2 in a 16-bit sample.
 
+## Speed
+
+`tools/bench_sdat.py` times the synthesizer against the Tallgrass engine's on the same
+sequences: `tools/sdat_bench.esk` (built with `eskiuc -O2`) and `tools/sdat_bench.rs`
+(built as an example of the engine crate) render each sequence looping into a reused
+4096-frame buffer, time only the render calls and hash the 16-bit output. The script runs
+the two in turn, keeps each side's fastest time and fails if a hash differs.
+
+On an Apple M-series Mac, 60 s of each battle theme, best of 5:
+
+| SDAT | Sequences | Engine (ns a frame) | `nds` (ns a frame) |
+|---|---|---|---|
+| Black 2 | 41 | 33.3 | 19.6 |
+| HeartGold | 15 | 30.9 | 18.7 |
+| Platinum | 14 | 27.4 | 16.6 |
+
+Before the synthesizer mixed a span at a time (0.2.0), the same runs took 27.5, 26.7 and
+23.4 ns a frame. After the change all 3775 sequences of the three SDATs rendered for 10 s
+are still identical to the engine's (`tools/compare_sdat.py`).
+
 ## Sources
 
 The cell animation, sequence archive, stream and text readers follow these public

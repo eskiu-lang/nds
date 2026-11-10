@@ -31,5 +31,9 @@ wave (a cry is wave 0 of its archive) to 16-bit PCM.
 The synthesizer models the driver: a 192 Hz frame clock with a tempo accumulator,
 volumes summed in tenths of a dB, the driver's ADSR rate tables, pitch in 1/64 semitone
 with bend and LFO, PCM8, PCM16 and IMA-ADPCM samples with loops, PSG square waves and
-noise, 32 voices with stealing. It renders a busy battle theme 550 to 640 times faster
-than real time at `-O2` on an Apple M-series Mac (the Rust engine is 12 to 18% faster).
+noise, 32 voices with stealing. It mixes a span of samples at a time (up to the next
+driver frame, where no setting changes), voice by voice, four PCM voices to a loop, and
+each output sample still adds the voices in the same order with the same rounding. At
+`-O2` on an Apple M-series Mac it renders the battle themes of the three games 1,050 to
+1,250 times faster than real time; the Rust engine takes about 1.65 times as long
+(`tools/bench_sdat.py`, see [Checks](checks.md#speed)).
