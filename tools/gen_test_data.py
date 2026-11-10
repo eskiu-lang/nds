@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Writes the synthetic test files in tests/data:
 
-    python3 -I tools/gen_test_data.py [--ref SDAT_WAV] [--only sdat,sdat_arc,lz,archives,graphics,anims,text,textures]
+    python3 -I tools/gen_test_data.py [--ref SDAT_WAV] [--engine ENGINE]
+        [--only sdat,sdat_arc,lz,archives,graphics,anims,text,textures,anim3d,spl]
 
 Everything is built here from fixed seeds and known values; no file comes from a game.
 
@@ -1664,10 +1665,233 @@ def gen_model(tex_block):
         f.write("\n".join(lines) + "\n")
 
 
+# ---------------------------------------------------------------------------
+# 3D animations: BCA, BTA, BTP, BMA for the test model
+
+def anim_container(magic, blk, name, anim):
+    d = nitro_dict([(name, u32(0))], 4)
+    d = nitro_dict([(name, u32(8 + len(pad(d, 4))))], 4)
+    body = pad(d, 4) + anim
+    return container(magic, [blk + u32(8 + len(body)) + body])
+
+
+def basis_decode(ins):
+    """The rotation a packed basis (five uint16) stands for, column-major."""
+    inp = [ins[4], ins[0], ins[1], ins[2], ins[3]]
+    out = [0] * 6
+    for i in range(5):
+        out[i] = inp[i] >> 3
+        out[5] = ((out[5] << 3) | (inp[i] & 7)) & 0xFFFF
+    f = [((v & 0x1FFF) - (0x2000 if v & 0x1000 else 0)) / 4096 for v in out]
+    a = (f[1], f[2], f[3])
+    b = (f[4], f[0], f[5])
+    c = (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+    return list(a) + list(b) + list(c)
+
+
+def gen_anims3d():
+    lines = []
+    # BCA: 8 frames, one track per node of the test model. Node 0 is left alone; node 1
+    # has x sampled (fx32), y constant, z every 2 frames (fx16), a rotation sampled
+    # from the pivot table and constant scales; node 2 a constant basis rotation and
+    # scales every 4 frames (fx16 pairs)
+    info = lambda end, half, shift: end << 16 | (1 << 29 if half else 0) | shift << 30
+    data = b""
+    head = 0x14 + 2 * 3
+    head += (-head) % 4
+    recs = []
+    pivots = u16(0) + u16(fx(1, 12)) + u16(0) + u16(0x20) + u16(0) + u16(fx(1, 12))
+    basis_in = [0x7FF8, 0x0003, 0x0005, 0x7FF9, 0x0002]
+    basis = b"".join(u16(v) for v in basis_in)
+    # node 0
+    recs.append(u16(1) + bytes([0, 0]))
+    # node 1: data blocks follow the records; offsets patched below
+    recs.append(None)
+    recs.append(None)
+    tx = b"".join(u32(fx(k * 0.5, 12)) for k in range(8))
+    tz = b"".join(u16(fx(k, 12)) for k in range(5))
+    rot = b"".join(u16(0x8000 | (k % 2)) for k in range(8))
+    sc2 = b"".join(u16(fx(v, 12)) + u16(0) for v in (1, 2, 3))
+    n1_len = 4 + 8 + 4 + 8 + 8 + 8 * 3
+    n2_len = 4 + 4 + 8 * 3
+    rec_at = [head, head + 4, head + 4 + n1_len]
+    blob_at = rec_at[2] + n2_len
+    blobs, offs = b"", {}
+    for key, b in (("tx", tx), ("tz", tz), ("rot", rot), ("sx", sc2), ("sy", sc2), ("sz", sc2), ("piv", pivots), ("bas", basis)):
+        offs[key] = blob_at + len(blobs)
+        blobs += pad(b, 4)
+    n1 = (u16(0x3810) + bytes([0, 1]) + u32(info(8, False, 0)) + u32(offs["tx"]) + u32(fx(2, 12))
+          + u32(info(8, True, 1)) + u32(offs["tz"]) + u32(info(8, False, 0)) + u32(offs["rot"])
+          + (u32(fx(1.5, 12)) + u32(0)) * 3)
+    n2 = (u16(0x106) + bytes([0, 2]) + u16(0) + u16(0)
+          + u32(info(8, True, 2)) + u32(offs["sx"]) + u32(info(8, True, 2)) + u32(offs["sy"]) + u32(info(8, True, 2)) + u32(offs["sz"]))
+    assert len(n1) == n1_len and len(n2) == n2_len
+    hdr = b"J\0AC" + u16(8) + u16(3) + u32(0) + u32(offs["piv"]) + u32(offs["bas"]) + b"".join(u16(o) for o in rec_at)
+    hdr = hdr.ljust(head, b"\0")
+    anim = hdr + recs[0] + n1 + n2 + blobs
+    write("test.nsbca", anim_container(b"BCA0", b"JNT0", "testjoint", anim))
+    lines.append("basis " + " ".join(f"{v:.9f}" for v in basis_decode(basis_in)))
+    # BTA: 4 frames; mat_floor: scale s 2 (fx32 constant), scale t 0.5 (fx16 constant),
+    # a sampled rotation, translation s sampled (fx16), translation t every 2 frames (fx32)
+    rots = [(0, 1), (1, 0), (0, -1), (-1, 0)]
+    blob_at = 8 + len(pad(nitro_dict([("mat_floor", b"\0" * 40)], 40), 4))
+    rot_at = blob_at
+    rot_b = b"".join(u16(fx(s_, 12) & 0xFFFF) + u16(fx(c, 12) & 0xFFFF) for s_, c in rots)
+    ts_at = rot_at + len(rot_b)
+    ts_b = pad(b"".join(u16(fx(v, 12)) for v in (0, 0.25, 0.5, 0.75)), 4)
+    tt_at = ts_at + len(ts_b)
+    tt_b = b"".join(u32(fx(v, 12) & 0xFFFFFFFF) for v in (0, -1))
+    chans = (u16(4) + bytes([0, 0x20]) + u32(fx(2, 12)) + u16(4) + bytes([0, 0x30]) + u32(fx(0.5, 12))
+             + u16(4) + bytes([0, 0]) + u32(rot_at) + u16(4) + bytes([0, 0x10]) + u32(ts_at)
+             + u16(3) + bytes([0, 0x40]) + u32(tt_at))
+    anim = b"M\0AT" + u16(4) + bytes([0, 0]) + pad(nitro_dict([("mat_floor", chans)], 40), 4)
+    assert len(anim) == blob_at
+    anim += rot_b + ts_b + tt_b
+    write("test.nsbta", anim_container(b"BTA0", b"SRT0", "testsrt", anim))
+    # BTP: 10 frames; mat_wall switches from sixteen to four at frame 5
+    names_at = 12 + len(pad(nitro_dict([("mat_wall", b"\0" * 8)], 8), 4))
+    keys_at = names_at + 64
+    track = u16(2) + u16(0) + u16(0) + u16(keys_at)
+    anim = b"M\0PT" + u16(10) + bytes([2, 2]) + u16(names_at) + u16(names_at + 32) + pad(nitro_dict([("mat_wall", track)], 8), 4)
+    assert len(anim) == names_at
+    anim += b"sixteen".ljust(16, b"\0") + b"four".ljust(16, b"\0") + b"sixteen".ljust(16, b"\0") + b"four".ljust(16, b"\0")
+    anim += u16(0) + bytes([0, 0]) + u16(5) + bytes([1, 1])
+    write("test.nsbtp", anim_container(b"BTP0", b"PAT0", "testpat", anim))
+    # BMA: 4 frames; mat_floor: diffuse constant red, ambient sampled, specular constant
+    # black, emission every 2 frames, alpha sampled
+    blob_at = 8 + len(pad(nitro_dict([("mat_floor", b"\0" * 20)], 20), 4))
+    amb_at = blob_at
+    amb_b = pad(b"".join(u16(v) for v in (0x1F, 0x3E0, 0x7C00)), 4)
+    emi_at = amb_at + len(amb_b)
+    emi_b = pad(b"".join(u16(v) for v in (0, 0x7FFF, 0)), 4)
+    alp_at = emi_at + len(emi_b)
+    alp_b = bytes([31, 0, 16, 0])
+    ch = lambda v, nf, const, shift: u32(v | nf << 16 | (1 << 29 if const else 0) | shift << 30)
+    chans = ch(0x1F, 4, True, 0) + ch(amb_at, 3, False, 0) + ch(0, 4, True, 0) + ch(emi_at, 4, False, 1) + ch(alp_at, 3, False, 0)
+    anim = b"M\0AM" + u16(4) + u16(0) + pad(nitro_dict([("mat_floor", chans)], 20), 4)
+    assert len(anim) == blob_at
+    anim += amb_b + emi_b + alp_b
+    write("test.nsbma", anim_container(b"BMA0", b"MAT0", "testcolor", anim))
+    with open(os.path.join(DATA, "anim3d.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# SPL particles
+
+def gen_spl(engine):
+    """test.spa: two resources (one with every optional block and field, one bare) and
+    two textures. With --engine (the Tallgrass engine), its `--spa-to-json` writes the
+    expected JSON."""
+    def emitter(flags, vals):
+        r = bytearray(88)
+        struct.pack_into("<I", r, 0, flags)
+        for off, fmt, v in vals:
+            struct.pack_into("<" + fmt, r, off, v)
+        return bytes(r)
+    full_flags = 6 | 1 << 4 | 2 << 6 | 0xF << 8 | 1 << 12 | 1 << 13 | 1 << 14 | 1 << 15 | 1 << 16 | 1 << 17 | 1 << 19 | 1 << 21 | 0x3F << 24
+    e0 = emitter(full_flags, [(4, "i", -27104), (8, "i", 4096), (16, "i", 8192), (20, "i", 10659), (24, "i", 10354),
+                              (28, "h", 4096), (30, "h", -4096), (34, "H", 32557), (36, "i", 685), (40, "i", 3274),
+                              (44, "i", 2436), (48, "H", 4096), (50, "H", 30), (52, "h", -853), (54, "h", 609),
+                              (56, "H", 12181), (60, "H", 210), (62, "H", 28), (64, "B", 78), (65, "B", 3),
+                              (66, "B", 51), (68, "B", 2), (69, "B", 29), (70, "B", 128), (71, "B", 1), (72, "B", 4),
+                              (73, "H", 655), (75, "B", 1 | 1 << 2 | 2 << 4 | 0x80), (76, "B", 1 | 2 << 2),
+                              (80, "h", -4096), (82, "h", 4096)])
+    scale = u16(4872) + u16(2802) + u16(1340) + bytes([20, 200, 1, 0, 0, 0])
+    color = u16(32767) + u16(28401) + bytes([34, 128, 204, 0, 5, 0, 0, 0])
+    alpha = u16(31 | 25 << 5 | 1 << 10) + bytes([104, 1, 26, 128, 0, 0])
+    texanim = bytes([0, 1, 1, 0, 0, 0, 0, 0, 2, 64, 2, 0])
+    child = (u16(1 | 2 | 4 | 1 << 3 | 0x20 | 0x40 | 1 << 7 | 1 << 9 | 1 << 11) + u16(-365 & 0xFFFF) + u16(731) + u16(16)
+             + bytes([153, 52]) + u16(13311) + bytes([3, 31, 2, 1, 1 | 1 << 2 | 1 << 5, 0, 0, 0]))
+    fields = (u16(0) + u16(-122 & 0xFFFF) + u16(0) + u16(0)                       # gravity
+              + u16(61) + u16(0) + u16(183) + u16(3)                               # random
+              + u32(-2048 & 0xFFFFFFFF) + u32(3807) + u32(0) + u16(274) + u16(0)   # magnet
+              + u16(6456) + u16(1)                                                 # spin
+              + u32(-47964 & 0xFFFFFFFF) + u16(1638) + bytes([1 | 4, 0])           # collision
+              + u32(40960) + u32(0) + u32(0) + u16(365) + u16(0))                  # convergence
+    r0 = e0 + scale + color + alpha + texanim + child + fields
+    r1 = emitter(1 << 14, [(16, "i", 4096), (44, "i", 4096), (48, "H", 4096), (62, "H", 10), (68, "B", 1), (69, "B", 31)])
+    res = r0 + r1
+    rnd = random.Random(23)
+
+    def tex(fmt, w, h, color0, data, pal):
+        p = fmt | (int(math.log2(w)) - 3) << 4 | (int(math.log2(h)) - 3) << 8 | (1 << 12 if fmt == 6 else 0) | (1 << 16 if color0 else 0)
+        pal_b = b"".join(u16(c) for c in pal)
+        total = 0x20 + len(data) + len(pal_b)
+        return (b" TPS" + u32(p) + u32(len(data)) + u32(0x20 + len(data)) + u32(len(pal_b)) + u32(0x20 + len(data) + len(pal_b))
+                + u32(0) + u32(total) + data + pal_b)
+    t0 = tex(6, 8, 8, True, bytes(rnd.randrange(256) for _ in range(64)), [rnd.randrange(0x8000) for _ in range(8)])
+    t1 = tex(2, 8, 8, True, bytes(rnd.randrange(256) for _ in range(16)), [rnd.randrange(0x8000) for _ in range(4)])
+    texs = t0 + t1
+    head = b" APS12_1" + u16(2) + u16(2) + u32(0) + u32(len(res)) + u32(len(texs)) + u32(0x20 + len(res)) + u32(0)
+    write("test.spa", head + res + texs)
+    if engine:
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        shutil.copy(os.path.join(DATA, "test.spa"), tmp)
+        subprocess.run([engine, "--spa-to-json", tmp, os.path.join(tmp, "out")], check=True, stdout=subprocess.DEVNULL)
+        shutil.copy(os.path.join(tmp, "out", "test.json"), os.path.join(DATA, "spl.json"))
+        for k in range(2):
+            w, h, px = png_rgba(open(os.path.join(tmp, "out", f"test_{k}.png"), "rb").read())
+            write(f"spl_{k}.rgba", struct.pack("<II", w, h) + px)
+        shutil.rmtree(tmp)
+
+
+def png_rgba(b):
+    """Width, height and RGBA bytes of an 8-bit RGBA, RGB or indexed PNG (no interlace)."""
+    import zlib
+    o, idat, w, h, ctype, plte, trns = 8, b"", 0, 0, 6, b"", b""
+    while o < len(b):
+        n = struct.unpack(">I", b[o:o + 4])[0]
+        kind, body = b[o + 4:o + 8], b[o + 8:o + 8 + n]
+        if kind == b"IHDR":
+            w, h, _depth, ctype = struct.unpack(">IIBB", body[:10])
+        elif kind == b"IDAT":
+            idat += body
+        elif kind == b"PLTE":
+            plte = body
+        elif kind == b"tRNS":
+            trns = body
+        o += 12 + n
+    raw = zlib.decompress(idat)
+    bpp = {6: 4, 2: 3, 3: 1}[ctype]
+    stride = w * bpp
+    out, prev = bytearray(), bytearray(stride)
+    for y in range(h):
+        f = raw[y * (stride + 1)]
+        line = bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for x in range(stride):
+            a = line[x - bpp] if x >= bpp else 0
+            up = prev[x]
+            c = prev[x - bpp] if x >= bpp else 0
+            if f == 1:
+                line[x] = (line[x] + a) & 255
+            elif f == 2:
+                line[x] = (line[x] + up) & 255
+            elif f == 3:
+                line[x] = (line[x] + (a + up) // 2) & 255
+            elif f == 4:
+                p = a + up - c
+                pa, pb, pc = abs(p - a), abs(p - up), abs(p - c)
+                line[x] = (line[x] + (a if pa <= pb and pa <= pc else up if pb <= pc else c)) & 255
+        prev = line
+        if ctype == 3:
+            out += b"".join(plte[i * 3:i * 3 + 3] + bytes([trns[i] if i < len(trns) else 255]) for i in line)
+        elif bpp == 3:
+            out += b"".join(bytes(line[i:i + 3]) + b"\xff" for i in range(0, stride, 3))
+        else:
+            out += line
+    return w, h, bytes(out)
+
+
 def main():
     ref = None
     if "--ref" in sys.argv:
         ref = sys.argv[sys.argv.index("--ref") + 1]
+    engine = None
+    if "--engine" in sys.argv:
+        engine = sys.argv[sys.argv.index("--engine") + 1]
     only = None
     if "--only" in sys.argv:
         only = sys.argv[sys.argv.index("--only") + 1].split(",")
@@ -1692,6 +1916,10 @@ def main():
     if want("textures") or want("model"):
         t = gen_textures()
         gen_model(t)
+    if want("anim3d"):
+        gen_anims3d()
+    if want("spl"):
+        gen_spl(engine)
 
 
 if __name__ == "__main__":

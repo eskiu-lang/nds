@@ -1,0 +1,77 @@
+// SPL particles: tests/data/test.spa read with <nds/spl>, its JSON compared byte for
+// byte with spl.json and its textures with spl_*.rgba, the output of the Tallgrass
+// engine's `--spa-to-json` (tools/gen_test_data.py --engine).
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <nds/bin>;
+import <nds/image>;
+import <nds/model>;
+import <nds/spl>;
+
+int fails = 0;
+
+void check(bool ok, string what) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+NdsData slurp(string name) {
+    let p: Bytes;
+    p.init(64);
+    p.append_raw((*uint8)"tests/data/", 11);
+    p.append_raw((*uint8)name, strlen(name));
+    p.push(0);
+    int64 n = 0;
+    *uint8 d = fs_read_all((string)p.data, &n);
+    p.free();
+    return NdsData{data: d, len: n};
+}
+
+bool same_image(NdsImage* img, string name) {
+    NdsData e = slurp(name);
+    if (e.data == null) return false;
+    defer free((*void)e.data);
+    if (e.u32(0) != (int64)img.width || e.u32(4) != (int64)img.height) return false;
+    int64 n = (int64)img.width * (int64)img.height * 4;
+    return e.len == n + 8 && memcmp((*void)(e.data + 8), (*void)img.rgba, n) == 0;
+}
+
+NdsData d = slurp("test.spa");
+Result<NdsSpl, string> r = spl_read(d.data, d.len);
+if (!r.ok) {
+    printf("FAIL %s\n", r.error);
+    return 1;
+}
+NdsSpl s = r.value;
+check(s.nres == 2 && s.ntex == 2, "resource and texture counts");
+NdsSplResource* r0 = &s.res[0];
+check(r0.has_scale && r0.has_color && r0.has_alpha && r0.has_tex_anim && r0.has_child && r0.nfields == 6, "optional blocks");
+check(r0.e.shape == SPL_SHAPE_CYLINDER_SURFACE && r0.e.position[0] == -27104 && r0.e.gen_count == 8192 && r0.e.directional_scale == 655, "emitter values");
+check(r0.scale.start == 4872 && r0.color.random && r0.alpha.mid == 25 && r0.tex_anim.count == 2 && r0.child.init_velocity_random == -365, "animations and child");
+check(r0.fields[0].kind == SPL_FIELD_GRAVITY && r0.fields[0].vec[1] == -122 && r0.fields[4].a == -47964 && r0.fields[4].flag && r0.fields[5].vec[0] == 40960, "fields");
+check(!s.res[1].has_scale && s.res[1].nfields == 0 && s.res[1].e.particle_life == 10, "a bare resource");
+check(s.tex[0].format == NDS_TEX_A5I3 && s.tex[0].repeat_s && s.tex[1].format == NDS_TEX_4 && s.tex[1].color0, "textures");
+let j: String;
+j.init(1024);
+s.json("test", &j);
+NdsData want = slurp("spl.json");
+check(want.len == j.len && memcmp((*void)want.data, (*void)j.cstr(), j.len) == 0, "the engine's JSON, byte for byte");
+free((*void)want.data);
+j.free();
+// the textures, as the engine decoded them
+string[2] rgba = {"spl_0.rgba", "spl_1.rgba"};
+for (i in 0..2) {
+    Result<NdsImage, string> img = s.image(i);
+    check(img.ok && same_image(&img.value, rgba[i]), "the engine's texture pixels");
+    if (img.ok) img.value.free();
+}
+check(!spl_read(d.data, 40).ok, "a truncated archive");
+s.free();
+free((*void)d.data);
+if (fails > 0) return 1;
+printf("spl: ok\n");

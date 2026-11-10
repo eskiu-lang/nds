@@ -1,0 +1,137 @@
+// The test model with its texture set and its four animations written as glTF by
+// <nds/gltf> into build/test_gltf, then read back: the document's parts, the buffer,
+// the images and the JSON side files.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <json>;
+import <math>;
+import <nds/bin>;
+import <nds/image>;
+import <nds/model>;
+import <nds/anim>;
+import <nds/gltf>;
+
+int fails = 0;
+
+void check(bool ok, string what) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+NdsData slurp(string path) {
+    int64 n = 0;
+    *uint8 d = fs_read_all(path, &n);
+    return NdsData{data: d, len: n};
+}
+
+NdsData data(string name) {
+    let p: String;
+    p.init(64);
+    p.appendf("tests/data/%s", name);
+    NdsData d = slurp(p.cstr());
+    p.free();
+    return d;
+}
+
+string text(string path, String* out) {
+    out.init(1024);
+    fs_read_text(path, out);
+    return out.cstr();
+}
+
+string dir = "build/test_gltf";
+NdsData md = data("test.nsbmd");
+Result<NdsModel, string> mr = nsbmd_read(md.data, md.len);
+Result<NdsTexSet, string> tr = nds_texset(md.data, md.len);
+if (!mr.ok || !tr.ok) {
+    printf("FAIL cannot read the test model\n");
+    return 1;
+}
+NdsModel m = mr.value;
+NdsTexSet ts = tr.value;
+string[4] files = {"test.nsbca", "test.nsbta", "test.nsbtp", "test.nsbma"};
+NdsAnimFile[4] anims;
+NdsData[4] bufs;
+for (i in 0..4) {
+    bufs[i] = data(files[i]);
+    Result<NdsAnimFile, string> a = nds_anim_read(bufs[i].data, bufs[i].len);
+    check(a.ok, files[i]);
+    anims[i] = a.value;
+}
+NdsGltfOptions opt = nds_gltf_options();
+Result<int, string> w = nds_gltf_write(&m, &ts, &anims[0], 4, dir, "testmodel", &opt);
+check(w.ok && w.value == 3, "three animations written");
+if (!w.ok) printf("  %s\n", w.error);
+
+let s: String;
+*JsonValue doc = json_parse(text("build/test_gltf/testmodel.gltf", &s));
+check(doc != null, "the glTF is JSON");
+if (doc != null) {
+    JsonValue* nodes = JsonValue_get(doc, "nodes");
+    check(JsonValue_len(nodes) == 3, "two joints and the mesh node");
+    check(strcmp(JsonValue_as_cstr(JsonValue_get(JsonValue_at(nodes, 1), "name")), "arm") == 0, "joints named after nodes");
+    JsonValue* skin = JsonValue_at(JsonValue_get(doc, "skins"), 0);
+    check(JsonValue_len(JsonValue_get(skin, "joints")) == 2 && (int)JsonValue_as_double(JsonValue_get(skin, "skeleton")) == 0, "skin");
+    JsonValue* prims = JsonValue_get(JsonValue_at(JsonValue_get(doc, "meshes"), 0), "primitives");
+    check(JsonValue_len(prims) == 2, "a primitive per draw");
+    JsonValue* attrs = JsonValue_get(JsonValue_at(prims, 0), "attributes");
+    check(JsonValue_get(attrs, "JOINTS_0") != null && JsonValue_get(attrs, "WEIGHTS_0") != null && JsonValue_get(attrs, "TEXCOORD_0") != null, "skinned attributes");
+    JsonValue* mats = JsonValue_get(doc, "materials");
+    JsonValue* floor = JsonValue_at(mats, 0);
+    check(strcmp(JsonValue_as_cstr(JsonValue_get(floor, "name")), "mat_floor") == 0 && JsonValue_as_bool(JsonValue_get(floor, "doubleSided")) != 0, "materials");
+    JsonValue* bct = JsonValue_get(JsonValue_get(floor, "pbrMetallicRoughness"), "baseColorTexture");
+    check(JsonValue_get(JsonValue_get(bct, "extensions"), "KHR_texture_transform") != null, "a texture transform to animate");
+    JsonValue* wall = JsonValue_at(mats, 1);
+    check(strcmp(JsonValue_as_cstr(JsonValue_get(wall, "alphaMode")), "BLEND") == 0, "translucent material");
+    JsonValue* samp = JsonValue_at(JsonValue_get(doc, "samplers"), 0);
+    check((int)JsonValue_as_double(JsonValue_get(samp, "wrapS")) == 10497 && (int)JsonValue_as_double(JsonValue_get(samp, "magFilter")) == 9728, "sampler");
+    JsonValue* an = JsonValue_get(doc, "animations");
+    check(JsonValue_len(an) == 3, "animations");
+    JsonValue* a0 = JsonValue_at(an, 0);
+    check(strcmp(JsonValue_as_cstr(JsonValue_get(a0, "name")), "testjoint") == 0 && JsonValue_len(JsonValue_get(a0, "channels")) == 3, "joint channels");
+    JsonValue* c1 = JsonValue_at(JsonValue_get(JsonValue_at(an, 1), "channels"), 0);
+    JsonValue* ptr = JsonValue_get(JsonValue_get(JsonValue_get(JsonValue_get(c1, "target"), "extensions"), "KHR_animation_pointer"), "pointer");
+    check(ptr != null && strcmp(JsonValue_as_cstr(ptr), "/materials/0/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform/offset") == 0, "texture offset pointer");
+    JsonValue* buf = JsonValue_at(JsonValue_get(doc, "buffers"), 0);
+    NdsData bin = slurp("build/test_gltf/testmodel.bin");
+    check(bin.data != null && (int64)JsonValue_as_double(JsonValue_get(buf, "byteLength")) == bin.len, "buffer length");
+    if (bin.data != null) free((*void)bin.data);
+    JsonValue_free(doc);
+}
+s.free();
+check(fs_exists("build/test_gltf/sixteen.png") != 0 && fs_exists("build/test_gltf/four.png") != 0, "texture images");
+let p: String;
+check(strcmp(text("build/test_gltf/testmodel.patterns.json", &p), "{\"frames\":10,\"materials\":{\"mat_wall\":[[0,\"sixteen.png\",\"sixteen\"],[5,\"four.png\",\"four\"]]}}") == 0, "pattern side file");
+p.free();
+*JsonValue uv = json_parse(text("build/test_gltf/testmodel.uvanims.json", &p));
+if (uv != null) {
+    JsonValue* off = JsonValue_at(JsonValue_get(JsonValue_get(uv, "mat_floor"), "offsets"), 2);
+    check(fabs(JsonValue_as_double(JsonValue_at(off, 0)) - 0.5) < 1e-6 && fabs(JsonValue_as_double(JsonValue_at(off, 1)) + 1.0) < 1e-6, "texture offsets side file");
+    JsonValue_free(uv);
+} else {
+    check(false, "texture offsets side file");
+}
+p.free();
+*JsonValue ma = json_parse(text("build/test_gltf/testmodel.matanims.json", &p));
+if (ma != null) {
+    JsonValue* fl = JsonValue_get(JsonValue_get(ma, "materials"), "mat_floor");
+    check(JsonValue_len(JsonValue_get(fl, "diffuse")) == 1 && JsonValue_len(JsonValue_get(fl, "alpha")) == 4, "color side file");
+    JsonValue_free(ma);
+} else {
+    check(false, "color side file");
+}
+p.free();
+for (i in 0..4) {
+    anims[i].free();
+    free((*void)bufs[i].data);
+}
+ts.free();
+m.free();
+free((*void)md.data);
+if (fails > 0) return 1;
+printf("gltf: ok\n");

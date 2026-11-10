@@ -1,0 +1,165 @@
+// BCA, BTA, BTP and BMA animations of the test model, against the values
+// tools/gen_test_data.py stored (tests/data/test.nsb*, anim3d.txt).
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <math>;
+import <nds/bin>;
+import <nds/model>;
+import <nds/anim>;
+
+extern double atof(string s);
+
+int fails = 0;
+
+void check(bool ok, string what) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(double a, double b) {
+    return fabs(a - b) < 1e-6;
+}
+
+NdsData slurp(string name) {
+    let p: Bytes;
+    p.init(64);
+    p.append_raw((*uint8)"tests/data/", 11);
+    p.append_raw((*uint8)name, strlen(name));
+    p.push(0);
+    int64 n = 0;
+    *uint8 d = fs_read_all((string)p.data, &n);
+    p.free();
+    return NdsData{data: d, len: n};
+}
+
+void joint() {
+    NdsData d = slurp("test.nsbca");
+    defer free((*void)d.data);
+    Result<NdsAnimFile, string> r = nds_anim_read(d.data, d.len);
+    if (!r.ok) {
+        check(false, r.error);
+        return;
+    }
+    NdsAnimFile a = r.value;
+    defer a.free();
+    check(strcmp(a.kind, "BCA0") == 0 && a.joint.size == 1 && a.srt.size == 0, "a joint animation file");
+    NdsJointAnim* ja = &a.joint.data[0];
+    check(strcmp(ja.name, "testjoint") == 0 && ja.frames == 8 && ja.ntracks == 3, "joint animation header");
+    check(!ja.tracks[0].animated && ja.tracks[1].animated && ja.tracks[2].animated, "animated tracks");
+    NdsJointTrack* t = &ja.tracks[1];
+    double[9] v = {9.0, 9.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    check(t.t_at(2.5, &v[0]) && near(v[0], 1.25) && near(v[1], 2.0) && near(v[2], 1.25), "translation between samples");
+    t.t_at(3.0, &v[0]);
+    check(near(v[2], 1.5) && t.t[2].step == 2 && t.t[2].count == 5, "a curve sampled every 2 frames");
+    t.t_at(20.0, &v[0]);
+    check(near(v[0], 3.5) && near(v[2], 4.0), "the last sample holds");
+    check(t.t[1].kind == NDS_CURVE_CONST && t.t[0].kind == NDS_CURVE_SAMPLES, "curve kinds");
+    t.r.at(0.0, &v[0]);
+    check(near(v[0], 1.0) && near(v[4], 1.0) && near(v[8], 1.0), "pivot rotation at frame 0");
+    t.r.at(1.0, &v[0]);
+    check(near(v[5], 1.0) && near(v[7], -1.0) && near(v[4], 0.0), "pivot rotation at frame 1");
+    double[3] sc = {0.0, 0.0, 0.0};
+    check(t.s_at(4.0, &sc[0]) && near(sc[0], 1.5) && near(sc[2], 1.5), "constant scale");
+    NdsJointTrack* u = &ja.tracks[2];
+    double[3] keep = {7.0, 7.0, 7.0};
+    check(!u.t_at(1.0, &keep[0]) && keep[0] == 7.0, "a part left alone keeps its value");
+    u.s_at(2.0, &sc[0]);
+    check(near(sc[0], 1.5) && u.s[0].step == 4 && u.s[0].count == 3, "a curve sampled every 4 frames");
+    u.s_at(6.0, &sc[0]);
+    check(near(sc[1], 2.5), "scale between samples");
+    // the packed basis rotation
+    NdsData txt = slurp("anim3d.txt");
+    defer free((*void)txt.data);
+    u.r.at(0.0, &v[0]);
+    bool same = u.r.kind == NDS_CURVE_CONST;
+    int64 o = 6;
+    for (k in 0..9) {
+        while (o < txt.len && txt.data[o] == 32) o++;
+        double want = atof((string)(txt.data + o));
+        while (o < txt.len && txt.data[o] != 32 && txt.data[o] != 10) o++;
+        if (fabs(v[k] - want) > 1e-6) same = false;
+    }
+    check(same, "basis rotation");
+}
+
+void srt() {
+    NdsData d = slurp("test.nsbta");
+    defer free((*void)d.data);
+    Result<NdsAnimFile, string> r = nds_anim_read(d.data, d.len);
+    if (!r.ok) {
+        check(false, r.error);
+        return;
+    }
+    NdsAnimFile a = r.value;
+    defer a.free();
+    check(a.srt.size == 1 && a.srt.data[0].frames == 4 && a.srt.data[0].ntracks == 1, "SRT animation header");
+    NdsSrtTrack* t = &a.srt.data[0].tracks[0];
+    check(strcmp(t.material, "mat_floor") == 0, "SRT material");
+    double[2] v;
+    t.scale_s.at(0.0, &v[0]);
+    check(near(v[0], 2.0) && t.scale_s.kind == NDS_CURVE_CONST, "constant scale (32 bits)");
+    t.scale_t.at(3.0, &v[0]);
+    check(near(v[0], 0.5), "constant scale (16 bits)");
+    t.rot.at(1.0, &v[0]);
+    check(near(v[0], 1.0) && near(v[1], 0.0) && t.rot.width == 2, "rotation sine and cosine");
+    t.trans_s.at(2.0, &v[0]);
+    check(near(v[0], 0.5), "sampled translation (16 bits)");
+    t.trans_t.at(1.0, &v[0]);
+    check(near(v[0], -0.5) && t.trans_t.step == 2 && t.trans_t.count == 2, "translation every 2 frames (32 bits)");
+}
+
+void pattern() {
+    NdsData d = slurp("test.nsbtp");
+    defer free((*void)d.data);
+    Result<NdsAnimFile, string> r = nds_anim_read(d.data, d.len);
+    if (!r.ok) {
+        check(false, r.error);
+        return;
+    }
+    NdsAnimFile a = r.value;
+    defer a.free();
+    NdsPatternAnim* p = &a.pattern.data[0];
+    check(p.frames == 10 && p.ntextures == 2 && p.npalettes == 2 && strcmp(p.textures[1], "four") == 0, "pattern names");
+    NdsPatternTrack* t = &p.tracks[0];
+    check(strcmp(t.material, "mat_wall") == 0 && t.nkeys == 2 && t.keys[1].frame == 5 && t.keys[1].texture == 1, "pattern keys");
+    check(t.key_at(4) == 0 && t.key_at(5) == 1 && t.key_at(99) == 1, "pattern key at a frame");
+}
+
+void color() {
+    NdsData d = slurp("test.nsbma");
+    defer free((*void)d.data);
+    Result<NdsAnimFile, string> r = nds_anim_read(d.data, d.len);
+    if (!r.ok) {
+        check(false, r.error);
+        return;
+    }
+    NdsAnimFile a = r.value;
+    defer a.free();
+    NdsColorAnim* c = &a.color.data[0];
+    check(c.frames == 4 && c.ntracks == 1 && strcmp(c.tracks[0].material, "mat_floor") == 0, "color animation header");
+    NdsColorTrack* t = &c.tracks[0];
+    double[3] v;
+    t.diffuse.at(2.0, &v[0]);
+    check(near(v[0], 1.0) && near(v[1], 0.0) && t.diffuse.kind == NDS_CURVE_CONST, "constant diffuse");
+    t.ambient.at(1.0, &v[0]);
+    check(near(v[0], 0.0) && near(v[1], 1.0) && near(v[2], 0.0), "sampled ambient");
+    t.ambient.at(1.5, &v[0]);
+    check(near(v[1], 0.5) && near(v[2], 0.5), "ambient between samples");
+    t.emission.at(1.0, &v[0]);
+    check(near(v[0], 0.5) && t.emission.step == 2 && t.emission.count == 3, "emission every 2 frames");
+    t.alpha.at(2.0, &v[0]);
+    check(near(v[0], 16.0 / 31.0) && t.alpha.width == 1, "sampled alpha");
+    check(!nds_anim_read(d.data, 40).ok, "a truncated animation");
+}
+
+joint();
+srt();
+pattern();
+color();
+if (fails > 0) return 1;
+printf("anim3d: ok\n");
