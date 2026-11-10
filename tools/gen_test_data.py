@@ -18,7 +18,14 @@ Everything is built here from fixed seeds and known values; no file comes from a
 - gen4.msg, gen5.msg: message files encrypted as the public descriptions say.
 - NARCs (named and unnamed), a small .nds ROM with a BLZ overlay, LZ10 and LZ11
   streams, NCLR/NCGR/NSCR/NCER files, an NSBTX with each of the seven texture formats
-  and an NSBMD; each with the expected pixels, bytes or triangles next to it.
+  and an NSBMD (three nodes, a skinning blend, two materials); each with the expected
+  pixels, bytes or triangles next to it.
+- test.nsbca, test.nsbta, test.nsbtp, test.nsbma: animations of the test model with
+  every curve kind (constant, sampled every 1, 2 and 4 frames, 16 and 32 bits); the
+  tests check their values by hand (anim3d.txt holds a packed rotation's matrix).
+- test.spa: an SPL archive with every optional block and field. With --engine (the
+  Tallgrass engine), its `--spa-to-json` writes spl.json and the pixels of its PNGs
+  (spl_*.rgba), which the tests compare with <nds/spl> byte for byte.
 """
 import math
 import os
@@ -1567,27 +1574,76 @@ def gen_model(tex_block):
         bodies += pad(c, 4)
     piece_dict = nitro_dict([("piece0", u32(rec_offs[0])), ("piece1", u32(rec_offs[1]))], 4)
     pieces = pad(piece_dict, 4) + piece_recs + bodies
-    # materials: dict of two (offsets unused here), pairing dicts for textures and palettes
-    mat_dict = nitro_dict([("mat_floor", u32(0)), ("mat_wall", u32(0))], 4)
+    # materials: two records, then the pairing dicts for textures and palettes
+    def material(dif_amb, spe_emi, pattr, tparams, misc, w, h, texmat=b""):
+        return (u16(0) + u16(44 + len(texmat)) + u32(dif_amb) + u32(spe_emi) + u32(pattr) + u32(0xFFFFFFFF)
+                + u32(tparams) + u32(0) + u16(0) + u16(misc) + u16(w) + u16(h) + u32(fx(1, 12)) + u32(fx(1, 12)) + texmat)
+    # floor: red diffuse, green ambient, blue emission, opaque, drawn from both sides
+    # (bit 6), repeating in s and t; wall: diffuse is the vertex color, alpha 16, a
+    # texture matrix scaling s by 2 and t by 0.5
+    mat_recs = [material(0x1F | 0x3E0 << 16, 0x7C00 << 16, 31 << 16 | 1 << 6, 3 << 16, 0, 8, 16),
+                material(0x7FFF | 1 << 15, 0, 16 << 16 | 3 << 6, 0, 1 | 4 | 8, 16, 8, u32(fx(2, 12)) + u32(fx(0.5, 12)))]
     head = 4
-    md_at = head
-    lists_at = md_at + len(pad(mat_dict, 4))
+    md_len = len(pad(nitro_dict([("mat_floor", u32(0)), ("mat_wall", u32(0))], 4), 4))
+    lists_at = head + md_len
     lists = bytes([0, 1, 0, 0])
     tex_pair_at = lists_at + len(lists)
     tex_pair = nitro_dict([("sixteen", u16(lists_at) + bytes([1, 0])), ("four", u16(lists_at + 1) + bytes([1, 0]))], 4)
     pal_pair_at = tex_pair_at + len(pad(tex_pair, 4))
     pal_pair = nitro_dict([("sixteen", u16(lists_at) + bytes([1, 0])), ("four", u16(lists_at + 1) + bytes([1, 0]))], 4)
-    mats = u16(tex_pair_at) + u16(pal_pair_at) + pad(mat_dict, 4) + lists + pad(tex_pair, 4) + pad(pal_pair, 4)
-    render = bytes([0x04, 0, 0x05, 0, 0x0B, 0x44, 1, 0x05, 1, 0x01])
+    recs_at = pal_pair_at + len(pad(pal_pair, 4))
+    mat_dict = nitro_dict([("mat_floor", u32(recs_at)), ("mat_wall", u32(recs_at + len(mat_recs[0])))], 4)
+    mats = u16(tex_pair_at) + u16(pal_pair_at) + pad(mat_dict, 4) + lists + pad(tex_pair, 4) + pad(pal_pair, 4) + b"".join(mat_recs)
+    # nodes: root moves up by 1; arm moves by 2 along x and turns 90 degrees about x
+    # (a pivot matrix); tip turns 90 degrees about z (a full matrix) and scales by 2
+    def node(flags, m0, body):
+        return u16(flags) + u16(m0 & 0xFFFF) + body
+    nodes = [("root", node(6, 0, b"".join(u32(fx(v, 12) & 0xFFFFFFFF) for v in (0, 1, 0)))),
+             ("arm", node(0x20C, 0, b"".join(u32(fx(v, 12) & 0xFFFFFFFF) for v in (2, 0, 0)) + u16(0) + u16(fx(1, 12)))),
+             ("tip", node(1, 0, b"".join(u16(fx(v, 12) & 0xFFFF) for v in (1, 0, -1, 0, 0, 0, 0, 1)) + b"".join(u32(fx(2, 12)) for _ in range(3))))]
+    nd = nitro_dict([(n, u32(0)) for n, _ in nodes], 4)
+    at = len(pad(nd, 4))
+    offs = []
+    for _, b in nodes:
+        offs.append(at)
+        at += len(b)
+    node_block = pad(nitro_dict([(n, u32(o)) for (n, _), o in zip(nodes, offs)], 4) + b"".join(b for _, b in nodes), 4)
+
+    def mat_mul(a, b):
+        return [[sum(a[r][k] * b[k][c] for k in range(4)) for c in range(4)] for r in range(4)]
+
+    def trans(x, y, z):
+        return [[1, 0, 0, x], [0, 1, 0, y], [0, 0, 1, z], [0, 0, 0, 1]]
+    rot_x = [[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]]
+    m_root = trans(0, 1, 0)
+    m_arm = mat_mul(m_root, mat_mul(trans(2, 0, 0), rot_x))
+
+    def inverse(m):
+        r = [[m[c][rr] for c in range(3)] for rr in range(3)]
+        t = [-sum(r[rr][k] * m[k][3] for k in range(3)) for rr in range(3)]
+        return [r[0] + [t[0]], r[1] + [t[1]], r[2] + [t[2]], [0, 0, 0, 1]]
+    ident = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+    invb = b""
+    for m in (inverse(m_root), inverse(m_arm), ident):
+        invb += b"".join(u32(fx(m[r][c], 12) & 0xFFFFFFFF) for c in range(4) for r in range(3)) + u32(0) * 9
+    # render: visibility; root stored in slot 0; arm (from slot 0) in slot 1; slot 2 the
+    # half and half blend of both; floor drawn from slot 0, wall from slot 2, both scaled
+    render = bytes([0x02, 2, 1, 0x26, 0, 0, 0, 0, 0x66, 1, 0, 0, 1, 0, 0x09, 2, 2, 0, 0, 128, 1, 1, 128,
+                    0x04, 0, 0x03, 0, 0x0B, 0x05, 0, 0x2B, 0x44, 1, 0x03, 2, 0x0B, 0x05, 1, 0x2B, 0x01])
     model_head = 0x40
-    render_at = model_head
+    nodes_at = model_head
+    render_at = nodes_at + len(node_block)
     mats_at = render_at + len(pad(render, 4))
     pieces_at = mats_at + len(pad(mats, 4))
+    invb_at = pieces_at + len(pieces)
     m = bytearray(b"\0" * model_head)
-    struct.pack_into("<IIII", m, 0, model_head + len(pad(render, 4)) + len(pad(mats, 4)) + len(pieces), render_at, mats_at, pieces_at)
+    struct.pack_into("<IIIII", m, 0, invb_at + len(invb), render_at, mats_at, pieces_at, invb_at)
+    m[23] = len(nodes)
+    m[24] = 2
+    m[25] = 2
     struct.pack_into("<I", m, 0x1C, fx(scale, 12))
     struct.pack_into("<I", m, 0x20, fx(1 / scale, 12))
-    model = bytes(m) + pad(render, 4) + pad(mats, 4) + pieces
+    model = bytes(m) + node_block + pad(render, 4) + pad(mats, 4) + pieces + invb
     mdl_dict = nitro_dict([("testmodel", u32(0))], 4)
     mdl_dict = nitro_dict([("testmodel", u32(8 + len(pad(mdl_dict, 4))))], 4)
     mdl0_body = pad(mdl_dict, 4) + model
@@ -1597,6 +1653,13 @@ def gen_model(tex_block):
     for mat, tex, tris in ((0, "sixteen", tris1), (1, "four", tris2)):
         for tri in tris:
             lines.append(f"tri {mat} {tex} " + " ".join(f"{c * scale:.6f}" for v in tri for c in v))
+    # the posed mesh: the floor in the root's space, the wall's blend is the identity at rest
+
+    def apply(m, v):
+        return [sum(m[r][k] * v[k] for k in range(3)) + m[r][3] for r in range(3)]
+    for mat, tris, mm in ((0, tris1, m_root), (1, tris2, ident)):
+        for tri in tris:
+            lines.append(f"mesh {mat} - " + " ".join(f"{c:.6f}" for v in tri for c in apply(mm, [x * scale for x in v])))
     with open(os.path.join(DATA, "model.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
 

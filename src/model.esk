@@ -10,6 +10,8 @@
 //     }
 //     NdsModel m = nsbmd_read(data, len)?;              // the first model
 //     defer m.free();
+//     NdsMesh mesh = m.mesh()?;                         // posed and skinned
+//     defer mesh.free();
 //
 // Textures: all seven DS formats are decoded. 1 A3I5 (32 colors, 3-bit
 // alpha), 2 4-color, 3 16-color, 4 256-color, 5 4x4 compressed (with its
@@ -17,20 +19,21 @@
 // Colors are 5-bit channels times 255 / 31 rounded down; the 4x4 blends are
 // made on the 5-bit values, as the hardware does.
 //
-// Models: the first model of an NSBMD, its materials (with the texture and
-// palette names each uses) and its triangles grouped by material, read from
-// the render commands and the pieces' GPU command lists: positions in all
-// the vertex formats, texture coordinates, normals and vertex colors. Like
-// the Tallgrass tools this is made for, the node matrices are not applied
-// (single-node models such as map blocks come out right; posed multi-node
-// models do not), and skinning, texture matrices and animations are not
-// read.
+// Models: the models of an NSBMD (nsbmd_open), their nodes, inverse bind
+// matrices and materials with their drawing state, and their triangles
+// grouped by material, read from the render commands and the pieces' GPU
+// command lists: positions in all the vertex formats, texture coordinates,
+// normals and vertex colors. The groups have no node matrix applied, as the
+// Tallgrass tools give them; NdsModel_mesh runs the commands with the node
+// matrices, the matrix stack and skinning, and gives every vertex the joints
+// and weights that move it.
 
 import <mem>;
 import <list>;
 import <result>;
 import <nds/bin>;
 import <nds/image>;
+import <math>;
 
 // ---- Nitro dictionaries ----
 
@@ -273,14 +276,35 @@ int _c8(int c5) {
     return c5 * 255 / 31;
 }
 
+int _c8r(int c5) {
+    return (c5 << 3) | (c5 >> 2);
+}
+
+// The 8-bit value of a 5-bit one: times 255 / 31 rounded down, or (rnd) its bits
+// repeated, (c << 3) | (c >> 2).
+int _c8m(int c5, bool rnd) {
+    return rnd ? _c8r(c5) : _c8(c5);
+}
+
 void _tex_put(NdsImage* img, int x, int y, int r5, int g5, int b5, int a) {
     img.set(x, y, _c8(r5), _c8(g5), _c8(b5), a);
+}
+
+void _tex_put_m(NdsImage* img, int x, int y, int r5, int g5, int b5, int a, bool rnd) {
+    img.set(x, y, _c8m(r5, rnd), _c8m(g5, rnd), _c8m(b5, rnd), a);
 }
 
 // Texture tex decoded with palette pal (an index of the set's palettes; -1
 // for none, which only direct-color textures need). Pixels past the data
 // read as 0 and colors past the palette are magenta.
 Result<NdsImage, string> NdsTexSet_image(NdsTexSet* self, int tex, int pal) {
+    return _tex_decode(self, tex, pal, false);
+}
+
+// NdsTexSet_image with 5-bit colors and alphas widened by repeating their bits (rnd) or
+// times 255 / 31 rounded down. With rnd a transparent color 0 keeps its palette color
+// (alpha 0), as the Tallgrass engine writes it.
+Result<NdsImage, string> _tex_decode(NdsTexSet* self, int tex, int pal, bool rnd) {
     if (tex < 0 || tex >= self.ntex) return Err<NdsImage, string>("tex0: no such texture");
     NdsTexture* t = &self.tex[tex];
     NdsData* d = &self.d;
@@ -302,9 +326,9 @@ Result<NdsImage, string> NdsTexSet_image(NdsTexSet* self, int tex, int pal) {
             int64 bi = i / (int64)per;
             int byte = bi < nbytes ? d.u8(base + bi) : 0;
             int c = (byte >> ((int)(i % (int64)per) * bpp)) & mask;
-            if (c == 0 && t.color0) continue;
+            if (c == 0 && t.color0 && !rnd) continue;
             _tex_color5(self, poff, (int64)c, &r, &g, &b);
-            _tex_put(&img, (int)(i % (int64)w), (int)(i / (int64)w), r, g, b, 255);
+            _tex_put_m(&img, (int)(i % (int64)w), (int)(i / (int64)w), r, g, b, c == 0 && t.color0 ? 0 : 255, rnd);
         }
     } else if (f == NDS_TEX_A3I5 || f == NDS_TEX_A5I3) {
         for (int64 i = 0; i < (int64)w * (int64)h; i++) {
@@ -320,12 +344,12 @@ Result<NdsImage, string> NdsTexSet_image(NdsTexSet* self, int tex, int pal) {
                 a5 = byte >> 3;
             }
             _tex_color5(self, poff, (int64)c, &r, &g, &b);
-            _tex_put(&img, (int)(i % (int64)w), (int)(i / (int64)w), r, g, b, _c8(a5));
+            _tex_put_m(&img, (int)(i % (int64)w), (int)(i / (int64)w), r, g, b, _c8m(a5, rnd), rnd);
         }
     } else if (f == NDS_TEX_DIRECT) {
         for (int64 i = 0; i < (int64)w * (int64)h; i++) {
             int c = d.u16(base + i * 2);
-            _tex_put(&img, (int)(i % (int64)w), (int)(i / (int64)w), c & 31, (c >> 5) & 31, (c >> 10) & 31, (c & 0x8000) != 0 ? 255 : 0);
+            _tex_put_m(&img, (int)(i % (int64)w), (int)(i / (int64)w), c & 31, (c >> 5) & 31, (c >> 10) & 31, (c & 0x8000) != 0 ? 255 : 0, rnd);
         }
     } else if (f == NDS_TEX_4X4) {
         int64 texel = self.cmp_data + t.offset;
@@ -362,7 +386,7 @@ Result<NdsImage, string> NdsTexSet_image(NdsTexSet* self, int tex, int pal) {
                     for (x in 0..4) {
                         int k = (row >> (x * 2)) & 3;
                         if (alpha[k] == 0) continue;
-                        _tex_put(&img, bx * 4 + x, by * 4 + y, col[k * 3], col[k * 3 + 1], col[k * 3 + 2], 255);
+                        _tex_put_m(&img, bx * 4 + x, by * 4 + y, col[k * 3], col[k * 3 + 1], col[k * 3 + 2], 255, rnd);
                     }
                 }
             }
@@ -397,25 +421,75 @@ struct NdsMeshGroup {
     bool has_colors;
 }
 
-// A material of a model: its name, and the names of its texture and palette (null when it
-// has none).
+// A material of a model: its name, the names of its texture and palette (null when it
+// has none), and its drawing state. Colors are BGR555 (5 bits a channel); alpha is 0
+// to 31. width and height are the texture size the material's texture coordinates are
+// in. The texture matrix (has_tex_matrix) scales, turns (by the sine and cosine in
+// tex_rot) and moves the texture coordinates, in texels.
 struct NdsMaterial {
     string name;
     string texture;
     string palette;
+    int diffuse;
+    int ambient;
+    int specular;
+    int emission;
+    bool diffuse_is_vertex_color;
+    bool shininess_table;
+    int alpha;
+    bool cull_back;
+    bool cull_front;
+    int64 polygon_attr;
+    int64 tex_params;
+    int width;
+    int height;
+    bool has_tex_matrix;
+    double[2] tex_scale;
+    double[2] tex_rot;
+    double[2] tex_trans;
 }
 
-// A model of an NSBMD: its name, the scale its positions were multiplied by, its
-// materials, and its triangles grouped by material. Free with free().
+// A 4x4 matrix of doubles in column-major order, as glTF stores them.
+struct NdsMat {
+    double[16] m;
+}
+
+// A node (bone) of a model: its name and its rest transform. has_t, has_r and has_s
+// say which parts the file stores (the others are identity); r is a 3x3 matrix in
+// column-major order, which may not be a pure rotation. matrix is translation times
+// rotation times scale.
+struct NdsNode {
+    string name;
+    bool has_t;
+    bool has_r;
+    bool has_s;
+    double[3] t;
+    double[9] r;
+    double[3] s;
+    NdsMat matrix;
+}
+
+// A model of an NSBMD: its name, the scales its positions are multiplied by (scale up
+// and down), its materials, nodes, inverse bind matrices and the bytes of its render
+// commands and pieces (copies, used by NdsModel_mesh), and its triangles grouped by
+// material with no node matrix applied. Free with free().
 struct NdsModel {
     string name;
     float scale;
+    float down_scale;
     int nmaterials;
     *NdsMaterial materials;
     List<NdsMeshGroup> groups;
+    int nnodes;
+    *NdsNode nodes;
+    int ninv;
+    *NdsMat inv_binds;
+    NdsData render;
+    int npieces;
+    *NdsData pieces;
 }
 
-// Frees the model's names, materials and meshes.
+// Frees the model's names, materials, nodes, command copies and meshes.
 void NdsModel_free(NdsModel* self) {
     if (self.name != null) free((*void)self.name);
     self.name = null;
@@ -429,6 +503,27 @@ void NdsModel_free(NdsModel* self) {
     }
     self.materials = null;
     self.nmaterials = 0;
+    if (self.nodes != null) {
+        for (i in 0..self.nnodes) {
+            if (self.nodes[i].name != null) free((*void)self.nodes[i].name);
+        }
+        free((*void)self.nodes);
+    }
+    self.nodes = null;
+    self.nnodes = 0;
+    if (self.inv_binds != null) free((*void)self.inv_binds);
+    self.inv_binds = null;
+    self.ninv = 0;
+    if (self.render.data != null) free((*void)self.render.data);
+    self.render = NdsData{data: null, len: 0};
+    if (self.pieces != null) {
+        for (i in 0..self.npieces) {
+            if (self.pieces[i].data != null) free((*void)self.pieces[i].data);
+        }
+        free((*void)self.pieces);
+    }
+    self.pieces = null;
+    self.npieces = 0;
     for (i in 0..self.groups.size) List_free<NdsVertex>(&self.groups.data[i].verts);
     if (self.groups.data != null) List_free<NdsMeshGroup>(&self.groups);
 }
@@ -674,10 +769,253 @@ Result<NdsModel, string> _nsbmd_fail(NdsModel* m, string e) {
     return Err<NdsModel, string>(e);
 }
 
-// The first model of an NSBMD file: its materials and its triangles grouped
-// by material (material -1 for pieces drawn with none), positions times the
-// model's scale.
+// An identity matrix.
+NdsMat nds_mat_identity() {
+    let r: NdsMat;
+    for (i in 0..16) r.m[i] = 0.0;
+    r.m[0] = 1.0;
+    r.m[5] = 1.0;
+    r.m[10] = 1.0;
+    r.m[15] = 1.0;
+    return r;
+}
+
+// The product a * b.
+NdsMat nds_mat_mul(NdsMat* a, NdsMat* b) {
+    let r: NdsMat;
+    for (c in 0..4) {
+        for (row in 0..4) {
+            double v = 0.0;
+            for (k in 0..4) v += a.m[k * 4 + row] * b.m[c * 4 + k];
+            r.m[c * 4 + row] = v;
+        }
+    }
+    return r;
+}
+
+// A matrix from translation t, the 3x3 column-major matrix r and scale s (t * r * s).
+NdsMat nds_mat_trs(double* t, double* r, double* s) {
+    NdsMat m = nds_mat_identity();
+    for (c in 0..3) {
+        for (row in 0..3) m.m[c * 4 + row] = r[c * 3 + row] * s[c];
+        m.m[12 + c] = t[c];
+    }
+    return m;
+}
+
+// The inverse of an affine matrix (bottom row 0 0 0 1). A singular one is nudged by
+// tiny amounts until it can be inverted, so the result is always finite.
+NdsMat nds_mat_inverse(NdsMat* a) {
+    NdsMat x = *a;
+    double[5] eps = {0.000012, -0.000017, 0.000006, -0.000008, 0.00001};
+    int k = 0;
+    while (true) {
+        double* m = &x.m[0];
+        double c00 = m[5] * m[10] - m[9] * m[6];
+        double c01 = m[9] * m[2] - m[1] * m[10];
+        double c02 = m[1] * m[6] - m[5] * m[2];
+        double det = m[0] * c00 + m[4] * c01 + m[8] * c02;
+        if (det != 0.0 && det == det) {
+            let r: NdsMat;
+            double id = 1.0 / det;
+            r.m[0] = c00 * id;
+            r.m[1] = c01 * id;
+            r.m[2] = c02 * id;
+            r.m[4] = (m[8] * m[6] - m[4] * m[10]) * id;
+            r.m[5] = (m[0] * m[10] - m[8] * m[2]) * id;
+            r.m[6] = (m[4] * m[2] - m[0] * m[6]) * id;
+            r.m[8] = (m[4] * m[9] - m[8] * m[5]) * id;
+            r.m[9] = (m[8] * m[1] - m[0] * m[9]) * id;
+            r.m[10] = (m[0] * m[5] - m[4] * m[1]) * id;
+            for (row in 0..3) r.m[12 + row] = 0.0 - (r.m[row] * m[12] + r.m[4 + row] * m[13] + r.m[8 + row] * m[14]);
+            r.m[3] = 0.0;
+            r.m[7] = 0.0;
+            r.m[11] = 0.0;
+            r.m[15] = 1.0;
+            return r;
+        }
+        x.m[(k % 3)] += eps[k % 5];
+        x.m[4 + (k + 1) % 3] += eps[(k + 1) % 5];
+        x.m[8 + (k + 2) % 3] += eps[(k + 2) % 5];
+        k++;
+    }
+    return x;
+}
+
+// The 3x3 matrix of a "pivot" rotation: one axis is +-1 and the other two hold a, b and
+// their negations, chosen by sel and neg. Column-major into out.
+void nds_pivot_matrix(int sel, int neg, double a, double b, double* out) {
+    for (i in 0..9) out[i] = 0.0;
+    if (sel >= 9) {
+        out[0] = 0.0 - a;
+        return;
+    }
+    double o = (neg & 1) == 0 ? 1.0 : -1.0;
+    double c = (neg & 2) == 0 ? b : 0.0 - b;
+    double d = (neg & 4) == 0 ? a : 0.0 - a;
+    // the nine layouts, column by column
+    double[81] t = {
+        o, 0.0, 0.0, 0.0, a, b, 0.0, c, d,
+        0.0, o, 0.0, a, 0.0, b, c, 0.0, d,
+        0.0, 0.0, o, a, b, 0.0, c, d, 0.0,
+        0.0, a, b, o, 0.0, 0.0, 0.0, c, d,
+        a, 0.0, b, 0.0, o, 0.0, c, 0.0, d,
+        a, b, 0.0, 0.0, 0.0, o, c, d, 0.0,
+        0.0, a, b, 0.0, c, d, o, 0.0, 0.0,
+        a, 0.0, b, c, 0.0, d, 0.0, o, 0.0,
+        a, b, 0.0, c, d, 0.0, 0.0, 0.0, o
+    };
+    for (i in 0..9) out[i] = t[sel * 9 + i];
+}
+
+// The 3x3 rotation of a packed basis (five uint16 at off): two unit vectors in 13
+// bits each plus sign, the third their cross product. Column-major into out.
+void nds_basis_matrix(NdsData* d, int64 off, double* out) {
+    int[5] input = {d.u16(off + 8), d.u16(off), d.u16(off + 2), d.u16(off + 4), d.u16(off + 6)};
+    int[6] o = {0, 0, 0, 0, 0, 0};
+    for (i in 0..5) {
+        o[i] = input[i] >> 3;
+        o[5] = ((o[5] << 3) | (input[i] & 7)) & 0xFFFF;
+    }
+    double[6] f;
+    for (i in 0..6) f[i] = (double)_fx((int64)o[i], 13, 12);
+    double ax = f[1];
+    double ay = f[2];
+    double az = f[3];
+    double bx = f[4];
+    double by = f[0];
+    double bz = f[5];
+    out[0] = ax;
+    out[1] = ay;
+    out[2] = az;
+    out[3] = bx;
+    out[4] = by;
+    out[5] = bz;
+    out[6] = ay * bz - az * by;
+    out[7] = az * bx - ax * bz;
+    out[8] = ax * by - ay * bx;
+}
+
+double _fx32(NdsData* d, int64 o) {
+    return (double)d.s32(o) / 4096.0;
+}
+
+double _fx16(NdsData* d, int64 o) {
+    return (double)d.s16(o) / 4096.0;
+}
+
+// Reads node i of the node dictionary entry at e.
+void _nds_node(NdsData* d, int64 o, NdsNode* n) {
+    int flags = d.u16(o);
+    int64 m0 = d.u16(o + 2);
+    int64 p = o + 4;
+    for (i in 0..9) n.r[i] = 0.0;
+    n.r[0] = 1.0;
+    n.r[4] = 1.0;
+    n.r[8] = 1.0;
+    for (i in 0..3) {
+        n.t[i] = 0.0;
+        n.s[i] = 1.0;
+    }
+    if ((flags & 1) == 0) {
+        n.has_t = true;
+        for (i in 0..3) n.t[i] = _fx32(d, p + (int64)i * 4);
+        p += 12;
+    }
+    if ((flags & 8) != 0) {
+        n.has_r = true;
+        nds_pivot_matrix((flags >> 4) & 15, (flags >> 8) & 15, _fx16(d, p), _fx16(d, p + 2), &n.r[0]);
+        p += 4;
+    } else if ((flags & 2) == 0) {
+        n.has_r = true;
+        n.r[0] = (double)_fx(m0, 16, 12);
+        for (i in 0..8) n.r[i + 1] = _fx16(d, p + (int64)i * 2);
+        p += 16;
+    }
+    if ((flags & 4) == 0) {
+        n.has_s = true;
+        for (i in 0..3) n.s[i] = _fx32(d, p + (int64)i * 4);
+    }
+    n.matrix = nds_mat_trs(&n.t[0], &n.r[0], &n.s[0]);
+}
+
+// Reads the drawing state of the material at o into mt.
+void _nds_material(NdsData* d, int64 o, NdsMaterial* mt) {
+    int64 da = d.u32(o + 4);
+    int64 se = d.u32(o + 8);
+    int64 pa = d.u32(o + 12);
+    int64 pmask = d.u32(o + 16);
+    int64 tp = d.u32(o + 20);
+    int misc = d.u16(o + 30);
+    mt.diffuse = (int)(da & 0x7FFF);
+    mt.diffuse_is_vertex_color = ((da >> 15) & 1) != 0;
+    mt.ambient = (int)((da >> 16) & 0x7FFF);
+    mt.specular = (int)(se & 0x7FFF);
+    mt.shininess_table = ((se >> 15) & 1) != 0;
+    mt.emission = (int)((se >> 16) & 0x7FFF);
+    mt.polygon_attr = pa;
+    mt.alpha = (int)((pa >> 16) & 31);
+    mt.cull_back = ((pa >> 6) & 1) == 0;
+    mt.cull_front = ((pa >> 7) & 1) == 0;
+    mt.tex_params = tp & pmask;
+    mt.width = d.u16(o + 32);
+    mt.height = d.u16(o + 34);
+    mt.tex_scale[0] = 1.0;
+    mt.tex_scale[1] = 1.0;
+    mt.tex_rot[0] = 0.0;
+    mt.tex_rot[1] = 1.0;
+    mt.tex_trans[0] = 0.0;
+    mt.tex_trans[1] = 0.0;
+    if ((misc & 1) != 0) {
+        mt.has_tex_matrix = true;
+        int64 p = o + 44;
+        if ((misc & 2) == 0) {
+            mt.tex_scale[0] = _fx32(d, p);
+            mt.tex_scale[1] = _fx32(d, p + 4);
+            p += 8;
+        }
+        if ((misc & 4) == 0) {
+            mt.tex_rot[0] = _fx16(d, p);
+            mt.tex_rot[1] = _fx16(d, p + 2);
+            p += 4;
+        }
+        if ((misc & 8) == 0) {
+            mt.tex_trans[0] = _fx32(d, p);
+            mt.tex_trans[1] = _fx32(d, p + 4);
+        }
+    }
+}
+
+// Copies n bytes at o (clipped to the buffer) into a new buffer.
+NdsData _nds_copy(NdsData* d, int64 o, int64 n) {
+    if (o < 0 || o > d.len) o = d.len;
+    if (n < 0) n = 0;
+    if (n > d.len - o) n = d.len - o;
+    *uint8 c = alloc<uint8>(n + 1);
+    if (n > 0) memcpy((*void)c, (*void)(d.data + o), n);
+    return NdsData{data: c, len: n};
+}
+
+// The number of models in an NSBMD file (0 when it has none or is not one).
+int nsbmd_count(*uint8 data, int64 len) {
+    NdsData dd = NdsData{data: data, len: len};
+    if (!dd.magic(0, "BMD0")) return 0;
+    int64 mdl0 = nds_block(&dd, "MDL0");
+    if (mdl0 < 0 || !dd.has(mdl0, 12)) return 0;
+    return dd.u8(mdl0 + 9);
+}
+
+// The first model of an NSBMD file (nsbmd_open with index 0).
 Result<NdsModel, string> nsbmd_read(*uint8 data, int64 len) {
+    return nsbmd_open(data, len, 0);
+}
+
+// Model index of an NSBMD file: its materials with their drawing state, its nodes and
+// inverse bind matrices, copies of its render commands and pieces, and its triangles
+// grouped by material (material -1 for pieces drawn with none), positions times the
+// model's scale and no node matrix applied. NdsModel_mesh builds the posed, skinned
+// mesh.
+Result<NdsModel, string> nsbmd_open(*uint8 data, int64 len, int index) {
     NdsData dd = NdsData{data: data, len: len};
     NdsData* d = &dd;
     if (!d.magic(0, "BMD0")) return Err<NdsModel, string>("nsbmd: not an NSBMD file");
@@ -688,18 +1026,48 @@ Result<NdsModel, string> nsbmd_read(*uint8 data, int64 len) {
     *_NdsDictEntry e = null;
     Result<int, string> nm = _nds_info_block(d, mdl0 + 8, 4, &e);
     if (!nm.ok) return _nsbmd_fail(&m, nm.error);
-    if (nm.value < 1) {
+    if (index < 0 || index >= nm.value) {
         _nds_dict_free(e, nm.value);
-        return _nsbmd_fail(&m, "nsbmd: no models");
+        return _nsbmd_fail(&m, "nsbmd: no such model");
     }
-    int64 mo = mdl0 + d.u32(e[0].data);
-    m.name = _nds_dup(e[0].name);
+    int64 mo = mdl0 + d.u32(e[index].data);
+    m.name = _nds_dup(e[index].name);
     _nds_dict_free(e, nm.value);
-    if (!d.has(mo, 0x20)) return _nsbmd_fail(&m, "nsbmd: model out of range");
+    if (!d.has(mo, 0x40)) return _nsbmd_fail(&m, "nsbmd: model out of range");
     int64 render = mo + d.u32(mo + 4);
     int64 mats = mo + d.u32(mo + 8);
     int64 pieces = mo + d.u32(mo + 12);
+    int64 invb = mo + d.u32(mo + 16);
     m.scale = _fx(d.u32(mo + 0x1C), 32, 12);
+    m.down_scale = _fx(d.u32(mo + 0x20), 32, 12);
+    // nodes
+    Result<int, string> nn = _nds_info_block(d, mo + 0x40, 4, &e);
+    if (!nn.ok) return _nsbmd_fail(&m, nn.error);
+    m.nnodes = nn.value;
+    m.nodes = alloc<NdsNode>((int64)m.nnodes + 1);
+    for (i in 0..m.nnodes) {
+        m.nodes[i].name = _nds_dup(e[i].name);
+        int64 no = mo + 0x40 + d.u32(e[i].data);
+        if (!d.has(no, 4)) {
+            _nds_dict_free(e, nn.value);
+            return _nsbmd_fail(&m, "nsbmd: node out of range");
+        }
+        _nds_node(d, no, &m.nodes[i]);
+    }
+    _nds_dict_free(e, nn.value);
+    // inverse bind matrices: a 4x3 and a 3x3 matrix of fx32 a node, as many as fit
+    m.inv_binds = alloc<NdsMat>((int64)m.nnodes + 1);
+    for (i in 0..m.nnodes) {
+        int64 o = invb + (int64)i * 84;
+        if (d.u32(mo + 16) == 0 || !d.has(o, 84)) break;
+        NdsMat x = nds_mat_identity();
+        for (c in 0..4) {
+            for (row in 0..3) x.m[c * 4 + row] = _fx32(d, o + (int64)(c * 3 + row) * 4);
+        }
+        m.inv_binds[i] = x;
+        m.ninv = i + 1;
+    }
+    // materials
     if (!d.has(mats, 6)) return _nsbmd_fail(&m, "nsbmd: materials out of range");
     int64 tex_pair = d.u16(mats);
     int64 pal_pair = d.u16(mats + 2);
@@ -709,7 +1077,10 @@ Result<NdsModel, string> nsbmd_read(*uint8 data, int64 len) {
     m.materials = alloc<NdsMaterial>((int64)m.nmaterials + 1);
     *string tex = alloc<string>((int64)m.nmaterials + 1);
     *string pal = alloc<string>((int64)m.nmaterials + 1);
-    for (i in 0..m.nmaterials) m.materials[i].name = _nds_dup(e[i].name);
+    for (i in 0..m.nmaterials) {
+        m.materials[i].name = _nds_dup(e[i].name);
+        _nds_material(d, mats + d.u32(e[i].data), &m.materials[i]);
+    }
     _nds_dict_free(e, nmat.value);
     string err = _nds_pairs(d, mats, tex_pair, tex, m.nmaterials);
     if (err == null) err = _nds_pairs(d, mats, pal_pair, pal, m.nmaterials);
@@ -720,20 +1091,17 @@ Result<NdsModel, string> nsbmd_read(*uint8 data, int64 len) {
     free((*void)tex);
     free((*void)pal);
     if (err != null) return _nsbmd_fail(&m, err);
+    // pieces
     Result<int, string> npc = _nds_info_block(d, pieces, 4, &e);
     if (!npc.ok) return _nsbmd_fail(&m, npc.error);
-    int npieces = npc.value;
-    *NdsData cmds = alloc<NdsData>((int64)npieces + 1);
-    for (i in 0..npieces) {
+    m.npieces = npc.value;
+    m.pieces = alloc<NdsData>((int64)m.npieces + 1);
+    for (i in 0..m.npieces) {
         int64 p = pieces + d.u32(e[i].data);
-        int64 co = p + d.u32(p + 8);
-        int64 cl = d.u32(p + 12);
-        if (co > len) co = len;
-        if (cl > len - co) cl = len - co;
-        cmds[i] = d.sub(co, cl);
+        m.pieces[i] = _nds_copy(d, p + d.u32(p + 8), d.u32(p + 12));
     }
-    _nds_dict_free(e, npieces);
-    int mat = -1;
+    _nds_dict_free(e, m.npieces);
+    // render commands, up to the end command
     int64 o = render;
     string bad = null;
     while (o < len) {
@@ -741,7 +1109,6 @@ Result<NdsModel, string> nsbmd_read(*uint8 data, int64 len) {
         o++;
         if (op == 0x01) break;
         if (op == 0x09) {
-            // skinning: index, term count, 3 bytes a term
             o += 2 + 3 * (int64)d.u8(o + 1);
             continue;
         }
@@ -750,19 +1117,677 @@ Result<NdsModel, string> nsbmd_read(*uint8 data, int64 len) {
             bad = "nsbmd: unknown render command";
             break;
         }
-        int p0 = d.u8(o);
+        o += (int64)n;
+    }
+    if (bad != null) return _nsbmd_fail(&m, bad);
+    m.render = _nds_copy(d, render, o - render);
+    // the triangles of each material, without node matrices
+    int mat = -1;
+    NdsData* rc = &m.render;
+    o = 0;
+    while (o < rc.len) {
+        int op = rc.u8(o);
+        o++;
+        if (op == 0x01) break;
+        if (op == 0x09) {
+            o += 2 + 3 * (int64)rc.u8(o + 1);
+            continue;
+        }
+        int n = _render_params(op);
+        int p0 = rc.u8(o);
         o += (int64)n;
         if (op == 0x04 || op == 0x24 || op == 0x44) {
             mat = p0;
         } else if (op == 0x05) {
-            if (p0 >= npieces) continue;
+            if (p0 >= m.npieces) continue;
             int gm = mat >= 0 && mat < m.nmaterials ? mat : -1;
             NdsMeshGroup* g = _nds_group(&m, gm);
-            bad = _gpu_run(cmds[p0], g, m.scale);
+            bad = _gpu_run(m.pieces[p0], g, m.scale);
             if (bad != null) break;
         }
     }
-    free((*void)cmds);
     if (bad != null) return _nsbmd_fail(&m, bad);
     return Ok<NdsModel, string>(m);
+}
+
+// ---- posed and skinned meshes ----
+
+// Joint kinds (NdsJoint.kind): a node of the model, a constant matrix (a scale or an
+// inverse bind matrix the render commands put between nodes) and the identity root
+// some models need.
+const int NDS_JOINT_NODE = 0;
+const int NDS_JOINT_CONST = 1;
+const int NDS_JOINT_ROOT = 2;
+
+// A joint of a mesh's skeleton: its parent joint (-1 for a top one), its kind
+// (NDS_JOINT_*), the model node it stands for (kind NODE), its transform relative to
+// its parent at rest (local), its rest transform in model space and the inverse of
+// that (inv_bind). A joint's parent chain is the chain of node matrices the render
+// commands multiply, so a node reached two ways has two joints. rest is the bind pose:
+// node matrices with any zero scale taken as 1, so that it can be inverted.
+struct NdsJoint {
+    int parent;
+    int kind;
+    int node;
+    NdsMat local;
+    NdsMat rest;
+    NdsMat inv_bind;
+}
+
+// A vertex of a posed mesh: position in model space at rest, texture coordinates (0 to 1
+// across the material's texture, t down), normal, color (0 to 1), and up to four joints
+// with their weights (summing to 1; unused slots have weight 0).
+struct NdsMeshVertex {
+    float[3] pos;
+    float[2] uv;
+    float[3] normal;
+    float[3] color;
+    int[4] joints;
+    float[4] weights;
+}
+
+// One draw of a piece with a material: count indices from first (triangles), and
+// whether its commands set texture coordinates, normals and colors.
+struct NdsPrim {
+    int material;
+    int piece;
+    int first;
+    int count;
+    bool has_uv;
+    bool has_normals;
+    bool has_colors;
+}
+
+// A model's geometry as the DS draws it at rest: vertices with their joints and
+// weights, triangles by index, one primitive per draw, and the skeleton. max_influences
+// is the most joints any vertex had before keeping its four largest; over4 counts the
+// vertices that had more than four. Free with free().
+struct NdsMesh {
+    List<NdsMeshVertex> verts;
+    List<int> indices;
+    List<NdsPrim> prims;
+    List<NdsJoint> joints;
+    int max_influences;
+    int64 over4;
+}
+
+// Frees the mesh's lists.
+void NdsMesh_free(NdsMesh* self) {
+    if (self.verts.data != null) List_free<NdsMeshVertex>(&self.verts);
+    if (self.indices.data != null) List_free<int>(&self.indices);
+    if (self.prims.data != null) List_free<NdsPrim>(&self.prims);
+    if (self.joints.data != null) List_free<NdsJoint>(&self.joints);
+}
+
+// The model-space bounds of the mesh's vertices into lo and hi (zero when it has none).
+void NdsMesh_bounds(NdsMesh* self, float* lo, float* hi) {
+    for (k in 0..3) {
+        lo[k] = (float)0.0;
+        hi[k] = (float)0.0;
+    }
+    for (i in 0..self.verts.size) {
+        NdsMeshVertex* v = &self.verts.data[i];
+        for (k in 0..3) {
+            if (i == 0 || v.pos[k] < lo[k]) lo[k] = v.pos[k];
+            if (i == 0 || v.pos[k] > hi[k]) hi[k] = v.pos[k];
+        }
+    }
+}
+
+// A symbolic matrix is a weighted sum of chains of factors; a chain is a node of a trie
+// whose edges are factors. Factor f < 256 is node f, 256 + i inverse bind i, and
+// 0x10000 + k constant k (a scale, or an unwritten stack slot).
+struct _SymNode {
+    int parent;
+    int factor;
+}
+
+struct _SymTerm {
+    float w;
+    int chain;
+}
+
+struct _SymMat {
+    int first;
+    int count;
+}
+
+struct _MeshBuild {
+    NdsModel* m;
+    NdsMesh* out;
+    List<_SymNode> trie;
+    List<_SymTerm> terms;
+    List<_SymMat> mats;
+    List<NdsMat> consts;
+    List<int> vmat;
+    int cur;
+    int[32] stack;
+    NdsMat num;
+    NdsMat[32] nstack;
+    int material;
+    int prim_type;
+    int prim_start;
+    NdsMeshVertex next;
+    NdsMat texm;
+    double tex_w;
+    double tex_h;
+}
+
+int _trie_child(_MeshBuild* b, int chain, int factor) {
+    for (i in 0..b.trie.size) {
+        if (b.trie.data[i].parent == chain && b.trie.data[i].factor == factor) return i;
+    }
+    b.trie.push(_SymNode{parent: chain, factor: factor});
+    return b.trie.size - 1;
+}
+
+int _sym_new(_MeshBuild* b) {
+    b.mats.push(_SymMat{first: b.terms.size, count: 0});
+    return b.mats.size - 1;
+}
+
+void _sym_term(_MeshBuild* b, int mat, float w, int chain) {
+    b.terms.push(_SymTerm{w: w, chain: chain});
+    b.mats.data[mat].count++;
+}
+
+int _sym_const(_MeshBuild* b, NdsMat* c) {
+    b.consts.push(*c);
+    return 0x10000 + b.consts.size - 1;
+}
+
+// The matrix in stack slot k; an unwritten slot holds a constant identity.
+int _sym_slot(_MeshBuild* b, int k) {
+    if (b.stack[k] < 0) {
+        NdsMat id = nds_mat_identity();
+        int f = _sym_const(b, &id);
+        int mm = _sym_new(b);
+        _sym_term(b, mm, (float)1.0, _trie_child(b, 0, f));
+        b.stack[k] = mm;
+    }
+    return b.stack[k];
+}
+
+bool _mat_is_identity(NdsMat* m) {
+    for (i in 0..16) {
+        double want = i % 5 == 0 ? 1.0 : 0.0;
+        if (fabs(m.m[i] - want) > 1e-9) return false;
+    }
+    return true;
+}
+
+// cur = cur * factor, symbolically and numerically.
+void _sym_mul(_MeshBuild* b, int factor, NdsMat* value) {
+    _SymMat src = b.mats.data[b.cur];
+    int mm = _sym_new(b);
+    for (i in 0..src.count) {
+        _SymTerm t = b.terms.data[src.first + i];
+        int chain = t.chain;
+        int last = chain > 0 ? b.trie.data[chain].factor : -1;
+        if (factor >= 0x10000 && last >= 0x10000) {
+            // two constants in a row are one: their product, or nothing when it is
+            // the identity (a scale up followed by its scale down)
+            NdsMat both = nds_mat_mul(&b.consts.data[last - 0x10000], value);
+            chain = b.trie.data[chain].parent;
+            if (!_mat_is_identity(&both)) chain = _trie_child(b, chain, _sym_const(b, &both));
+        } else {
+            chain = _trie_child(b, chain, factor);
+        }
+        _sym_term(b, mm, t.w, chain);
+    }
+    b.cur = mm;
+    b.num = nds_mat_mul(&b.num, value);
+}
+
+void _mesh_load(_MeshBuild* b, int k) {
+    k = k & 31;
+    b.cur = _sym_slot(b, k);
+    b.num = b.nstack[k];
+}
+
+void _mesh_store(_MeshBuild* b, int k) {
+    k = k & 31;
+    b.stack[k] = b.cur;
+    b.nstack[k] = b.num;
+}
+
+void _mesh_scale(_MeshBuild* b, double x, double y, double z) {
+    NdsMat s = nds_mat_identity();
+    s.m[0] = x;
+    s.m[5] = y;
+    s.m[10] = z;
+    _sym_mul(b, _sym_const(b, &s), &s);
+}
+
+void _mesh_tri(_MeshBuild* b, int i0, int i1, int i2) {
+    b.out.indices.push(i0);
+    b.out.indices.push(i1);
+    b.out.indices.push(i2);
+}
+
+// Turns the vertices of the open primitive into triangles.
+void _mesh_end_prim(_MeshBuild* b) {
+    int s = b.prim_start;
+    int e = b.out.verts.size;
+    if (b.prim_type == 0) {
+        for (int i = s; i + 2 < e; i += 3) _mesh_tri(b, i, i + 1, i + 2);
+    } else if (b.prim_type == 1) {
+        for (int i = s; i + 3 < e; i += 4) {
+            _mesh_tri(b, i, i + 1, i + 2);
+            _mesh_tri(b, i, i + 2, i + 3);
+        }
+    } else if (b.prim_type == 2) {
+        for (int i = s; i + 2 < e; i++) {
+            if ((i - s) % 2 == 0) {
+                _mesh_tri(b, i, i + 1, i + 2);
+            } else {
+                _mesh_tri(b, i + 1, i, i + 2);
+            }
+        }
+    } else {
+        for (int i = s; i + 3 < e; i += 2) {
+            _mesh_tri(b, i, i + 1, i + 3);
+            _mesh_tri(b, i, i + 3, i + 2);
+        }
+    }
+    b.prim_start = e;
+}
+
+void _mesh_vertex(_MeshBuild* b, double x, double y, double z) {
+    double* m = &b.num.m[0];
+    NdsMeshVertex v = b.next;
+    v.pos[0] = (float)(m[0] * x + m[4] * y + m[8] * z + m[12]);
+    v.pos[1] = (float)(m[1] * x + m[5] * y + m[9] * z + m[13]);
+    v.pos[2] = (float)(m[2] * x + m[6] * y + m[10] * z + m[14]);
+    b.out.verts.push(v);
+    b.vmat.push(b.cur);
+}
+
+// Runs a piece's GPU commands, adding its vertices and triangles.
+string _mesh_piece(_MeshBuild* b, NdsData cmds, NdsPrim* pr) {
+    double[3] p = {0.0, 0.0, 0.0};
+    int64 o = 0;
+    while (o + 4 <= cmds.len) {
+        int64 word = cmds.u32(o);
+        o += 4;
+        for (k in 0..4) {
+            int op = (int)((word >> (k * 8)) & 0xFF);
+            int np = _gpu_params(op);
+            if (np < 0) return "nsbmd: unknown GPU command";
+            if (op == 0x00 && k > 0) continue;
+            if (!cmds.has(o, (int64)np * 4)) return null;
+            int64 p0 = cmds.u32(o);
+            int64 p1 = np > 1 ? cmds.u32(o + 4) : (int64)0;
+            int64 p2 = np > 2 ? cmds.u32(o + 8) : (int64)0;
+            o += (int64)np * 4;
+            bool vtx = false;
+            if (op == 0x14) {
+                _mesh_load(b, (int)(p0 & 31));
+            } else if (op == 0x1B) {
+                _mesh_scale(b, (double)_fx(p0, 32, 12), (double)_fx(p1, 32, 12), (double)_fx(p2, 32, 12));
+            } else if (op == 0x40) {
+                _mesh_end_prim(b);
+                b.prim_type = (int)(p0 & 3);
+            } else if (op == 0x41) {
+                _mesh_end_prim(b);
+            } else if (op == 0x20) {
+                b.next.color[0] = (float)((double)(p0 & 31) / 31.0);
+                b.next.color[1] = (float)((double)((p0 >> 5) & 31) / 31.0);
+                b.next.color[2] = (float)((double)((p0 >> 10) & 31) / 31.0);
+                for (c in 0..3) b.next.normal[c] = (float)0.0;
+                pr.has_colors = true;
+            } else if (op == 0x21) {
+                double nx = (double)_fx(p0, 10, 9);
+                double ny = (double)_fx(p0 >> 10, 10, 9);
+                double nz = (double)_fx(p0 >> 20, 10, 9);
+                double* m = &b.num.m[0];
+                double tx = m[0] * nx + m[4] * ny + m[8] * nz;
+                double ty = m[1] * nx + m[5] * ny + m[9] * nz;
+                double tz = m[2] * nx + m[6] * ny + m[10] * nz;
+                double l = sqrt(tx * tx + ty * ty + tz * tz);
+                if (l > 0.0) {
+                    tx = tx / l;
+                    ty = ty / l;
+                    tz = tz / l;
+                }
+                b.next.normal[0] = (float)tx;
+                b.next.normal[1] = (float)ty;
+                b.next.normal[2] = (float)tz;
+                for (c in 0..3) b.next.color[c] = (float)1.0;
+                pr.has_normals = true;
+            } else if (op == 0x22) {
+                double s = (double)_fx(p0, 16, 4);
+                double t = (double)_fx(p0 >> 16, 16, 4);
+                double* tm = &b.texm.m[0];
+                double ts = tm[0] * s + tm[4] * t + tm[12];
+                double tt = tm[1] * s + tm[5] * t + tm[13];
+                b.next.uv[0] = (float)(ts / b.tex_w);
+                b.next.uv[1] = (float)(tt / b.tex_h);
+                pr.has_uv = true;
+            } else if (op == 0x23) {
+                p[0] = (double)_fx(p0, 16, 12);
+                p[1] = (double)_fx(p0 >> 16, 16, 12);
+                p[2] = (double)_fx(p1, 16, 12);
+                vtx = true;
+            } else if (op == 0x24) {
+                p[0] = (double)_fx(p0, 10, 6);
+                p[1] = (double)_fx(p0 >> 10, 10, 6);
+                p[2] = (double)_fx(p0 >> 20, 10, 6);
+                vtx = true;
+            } else if (op == 0x25) {
+                p[0] = (double)_fx(p0, 16, 12);
+                p[1] = (double)_fx(p0 >> 16, 16, 12);
+                vtx = true;
+            } else if (op == 0x26) {
+                p[0] = (double)_fx(p0, 16, 12);
+                p[2] = (double)_fx(p0 >> 16, 16, 12);
+                vtx = true;
+            } else if (op == 0x27) {
+                p[1] = (double)_fx(p0, 16, 12);
+                p[2] = (double)_fx(p0 >> 16, 16, 12);
+                vtx = true;
+            } else if (op == 0x28) {
+                p[0] = p[0] + (double)_fx(p0, 10, 12);
+                p[1] = p[1] + (double)_fx(p0 >> 10, 10, 12);
+                p[2] = p[2] + (double)_fx(p0 >> 20, 10, 12);
+                vtx = true;
+            }
+            if (vtx) _mesh_vertex(b, p[0], p[1], p[2]);
+        }
+    }
+    return null;
+}
+
+// The bind value of a factor: a node's matrix with its zero scales taken as 1 (see
+// _node_bind).
+NdsMat _factor_value(_MeshBuild* b, int f) {
+    if (f >= 0x10000) return b.consts.data[f - 0x10000];
+    if (f >= 256) return b.m.inv_binds[f - 256];
+    return _node_bind(&b.m.nodes[f]);
+}
+
+// A node's matrix for the bind pose. A node scaled to zero at rest (hidden until an
+// animation grows it) would collapse its vertices to a point, so its zero scales are
+// taken as 1: the vertices keep their shape in the mesh, and the node's own rest
+// transform, applied by the skin, still hides them.
+NdsMat _node_bind(NdsNode* n) {
+    double[3] s;
+    for (k in 0..3) s[k] = fabs(n.s[k]) < 0.000001 ? 1.0 : n.s[k];
+    return nds_mat_trs(&n.t[0], &n.r[0], &s[0]);
+}
+
+// The joint of a chain without its constant tail, made with its parents when new.
+int _mesh_joint(_MeshBuild* b, *int joint_of, int chain) {
+    while (chain != 0 && b.trie.data[chain].factor >= 256) chain = b.trie.data[chain].parent;
+    if (joint_of[chain] >= 0) return joint_of[chain];
+    let j: NdsJoint;
+    j.parent = -1;
+    j.node = -1;
+    if (chain == 0) {
+        j.kind = NDS_JOINT_ROOT;
+        j.local = nds_mat_identity();
+        j.rest = j.local;
+    } else {
+        int f = b.trie.data[chain].factor;
+        int up = b.trie.data[chain].parent;
+        // walk up through the constants too: each factor between nodes is a joint
+        int pj = -1;
+        if (up != 0) pj = _mesh_joint_any(b, joint_of, up);
+        j.parent = pj;
+        j.kind = f < 256 ? NDS_JOINT_NODE : NDS_JOINT_CONST;
+        j.node = f < 256 ? f : -1;
+        j.local = _factor_value(b, f);
+        if (pj >= 0) {
+            j.rest = nds_mat_mul(&b.out.joints.data[pj].rest, &j.local);
+        } else {
+            j.rest = j.local;
+        }
+    }
+    j.inv_bind = nds_mat_inverse(&j.rest);
+    b.out.joints.push(j);
+    joint_of[chain] = b.out.joints.size - 1;
+    return b.out.joints.size - 1;
+}
+
+// The joint of a chain as it is (constants included), for parents.
+int _mesh_joint_any(_MeshBuild* b, *int joint_of, int chain) {
+    if (joint_of[chain] >= 0) return joint_of[chain];
+    int f = b.trie.data[chain].factor;
+    if (f < 256) return _mesh_joint(b, joint_of, chain);
+    let j: NdsJoint;
+    int up = b.trie.data[chain].parent;
+    j.parent = up != 0 ? _mesh_joint_any(b, joint_of, up) : -1;
+    j.kind = NDS_JOINT_CONST;
+    j.node = -1;
+    j.local = _factor_value(b, f);
+    j.rest = j.parent >= 0 ? nds_mat_mul(&b.out.joints.data[j.parent].rest, &j.local) : j.local;
+    j.inv_bind = nds_mat_inverse(&j.rest);
+    b.out.joints.push(j);
+    joint_of[chain] = b.out.joints.size - 1;
+    return b.out.joints.size - 1;
+}
+
+// Joints and weights of every vertex from the symbolic matrix it was drawn with: like
+// terms are added, the four largest kept and renormalized.
+void _mesh_weights(_MeshBuild* b) {
+    *int joint_of = alloc<int>((int64)b.trie.size + 1);
+    for (i in 0..b.trie.size) joint_of[i] = -1;
+    *int jw_of = alloc<int>((int64)b.mats.size + 1);
+    for (i in 0..b.mats.size) jw_of[i] = -1;
+    List<int> cj;
+    cj.init(64);
+    List<float> cw;
+    cw.init(64);
+    List<int> cn;
+    cn.init(64);
+    for (vi in 0..b.out.verts.size) {
+        int mi = b.vmat.data[vi];
+        if (jw_of[mi] < 0) {
+            _SymMat sm = b.mats.data[mi];
+            int[8] js;
+            float[8] ws;
+            int n = 0;
+            int total = 0;
+            int[64] tj;
+            float[64] tw;
+            for (k in 0..sm.count) {
+                _SymTerm t = b.terms.data[sm.first + k];
+                int j = _mesh_joint(b, joint_of, t.chain);
+                bool found = false;
+                for (q in 0..total) {
+                    if (tj[q] == j) {
+                        tw[q] = tw[q] + t.w;
+                        found = true;
+                    }
+                }
+                if (!found && total < 64) {
+                    tj[total] = j;
+                    tw[total] = t.w;
+                    total++;
+                }
+            }
+            // largest first
+            for (a in 0..total) {
+                for (c in a + 1..total) {
+                    if (tw[c] > tw[a]) {
+                        float x = tw[a];
+                        tw[a] = tw[c];
+                        tw[c] = x;
+                        int y = tj[a];
+                        tj[a] = tj[c];
+                        tj[c] = y;
+                    }
+                }
+            }
+            int nz = 0;
+            for (a in 0..total) {
+                if (tw[a] != (float)0.0) nz++;
+            }
+            n = nz < 4 ? nz : 4;
+            float sum = (float)0.0;
+            for (a in 0..n) sum = sum + tw[a];
+            jw_of[mi] = cj.size;
+            cn.push(nz);
+            for (a in 0..4) {
+                cj.push(a < n ? tj[a] : 0);
+                cw.push(a < n && sum > (float)0.0 ? tw[a] / sum : (float)0.0);
+            }
+        }
+        int at = jw_of[mi];
+        int nz = cn.data[at / 4];
+        if (nz > b.out.max_influences) b.out.max_influences = nz;
+        if (nz > 4) b.out.over4++;
+        NdsMeshVertex* v = &b.out.verts.data[vi];
+        for (a in 0..4) {
+            v.joints[a] = cj.data[at + a];
+            v.weights[a] = cw.data[at + a];
+        }
+    }
+    cj.free();
+    cw.free();
+    cn.free();
+    free((*void)joint_of);
+    free((*void)jw_of);
+}
+
+// The model's geometry at rest as the DS draws it: the render commands and the pieces'
+// GPU commands run with the node matrices, the matrix stack and the skinning blends, so
+// positions and normals are in model space. A node scaled to zero at rest is taken at
+// scale 1 for the positions (see NdsJoint.rest), so its vertices keep their shape. Each vertex is given the joints that move
+// it (see NdsJoint), so a glTF skin of the mesh reproduces any pose of the nodes.
+Result<NdsMesh, string> NdsModel_mesh(NdsModel* self) {
+    let out: NdsMesh;
+    out.verts.init(256);
+    out.indices.init(512);
+    out.prims.init(16);
+    out.joints.init(16);
+    let b: _MeshBuild;
+    b.m = self;
+    b.out = &out;
+    b.trie.init(64);
+    b.terms.init(256);
+    b.mats.init(256);
+    b.consts.init(16);
+    b.vmat.init(256);
+    b.trie.push(_SymNode{parent: -1, factor: -1});
+    b.cur = _sym_new(&b);
+    _sym_term(&b, b.cur, (float)1.0, 0);
+    b.num = nds_mat_identity();
+    for (k in 0..32) {
+        b.stack[k] = -1;
+        b.nstack[k] = b.num;
+    }
+    b.material = 0;
+    NdsData* rc = &self.render;
+    int64 o = 0;
+    string bad = null;
+    while (o < rc.len && bad == null) {
+        int op = rc.u8(o);
+        o++;
+        if (op == 0x01) break;
+        if (op == 0x09) {
+            int slot = rc.u8(o);
+            int nt = rc.u8(o + 1);
+            int mm = _sym_new(&b);
+            let num: NdsMat;
+            for (i in 0..16) num.m[i] = 0.0;
+            for (t in 0..nt) {
+                int64 to = o + 2 + (int64)t * 3;
+                int sp = rc.u8(to) & 31;
+                int ib = rc.u8(to + 1);
+                float w = (float)((double)rc.u8(to + 2) / 256.0);
+                if (ib >= self.ninv) {
+                    bad = "nsbmd: skinning names a missing inverse bind matrix";
+                    break;
+                }
+                _SymMat src = b.mats.data[_sym_slot(&b, sp)];
+                for (i in 0..src.count) {
+                    _SymTerm st = b.terms.data[src.first + i];
+                    _sym_term(&b, mm, st.w * w, _trie_child(&b, st.chain, 256 + ib));
+                }
+                NdsMat x = nds_mat_mul(&b.nstack[sp], &self.inv_binds[ib]);
+                for (i in 0..16) num.m[i] = num.m[i] + (double)w * x.m[i];
+            }
+            b.cur = mm;
+            b.num = num;
+            _mesh_store(&b, slot);
+            o += 2 + 3 * (int64)nt;
+            continue;
+        }
+        int n = _render_params(op);
+        int p0 = rc.u8(o);
+        int p3 = rc.u8(o + 3);
+        int p4 = rc.u8(o + 4);
+        o += (int64)n;
+        if (op == 0x03) {
+            _mesh_load(&b, p0);
+        } else if (op == 0x04 || op == 0x24 || op == 0x44) {
+            b.material = p0;
+        } else if (op == 0x06 || op == 0x26 || op == 0x46 || op == 0x66) {
+            if (p0 >= self.nnodes) {
+                bad = "nsbmd: render commands name a missing node";
+                break;
+            }
+            if (op == 0x46) _mesh_load(&b, p3);
+            if (op == 0x66) _mesh_load(&b, p4);
+            NdsMat nb = _node_bind(&self.nodes[p0]);
+            _sym_mul(&b, p0, &nb);
+            if (op == 0x26 || op == 0x66) _mesh_store(&b, p3);
+        } else if (op == 0x0B || op == 0x2B) {
+            double s = op == 0x0B ? (double)self.scale : (double)self.down_scale;
+            _mesh_scale(&b, s, s, s);
+        } else if (op == 0x05) {
+            if (p0 >= self.npieces) continue;
+            let pr: NdsPrim;
+            pr.material = b.material < self.nmaterials ? b.material : -1;
+            pr.piece = p0;
+            pr.first = out.indices.size;
+            b.texm = nds_mat_identity();
+            b.tex_w = 1.0;
+            b.tex_h = 1.0;
+            for (c in 0..3) {
+                b.next.pos[c] = (float)0.0;
+                b.next.normal[c] = (float)0.0;
+                b.next.color[c] = (float)1.0;
+            }
+            b.next.uv[0] = (float)0.0;
+            b.next.uv[1] = (float)0.0;
+            if (pr.material >= 0) {
+                NdsMaterial* mt = &self.materials[pr.material];
+                if (mt.width > 0) b.tex_w = (double)mt.width;
+                if (mt.height > 0) b.tex_h = (double)mt.height;
+                if (mt.has_tex_matrix) {
+                    b.texm.m[0] = mt.tex_scale[0] * mt.tex_rot[1];
+                    b.texm.m[1] = 0.0 - mt.tex_scale[1] * mt.tex_rot[0];
+                    b.texm.m[4] = mt.tex_scale[0] * mt.tex_rot[0];
+                    b.texm.m[5] = mt.tex_scale[1] * mt.tex_rot[1];
+                    b.texm.m[12] = mt.tex_trans[0] * b.tex_w;
+                    b.texm.m[13] = mt.tex_trans[1] * b.tex_h;
+                }
+                if (mt.diffuse_is_vertex_color && mt.diffuse != 0x7FFF) {
+                    b.next.color[0] = (float)((double)(mt.diffuse & 31) / 31.0);
+                    b.next.color[1] = (float)((double)((mt.diffuse >> 5) & 31) / 31.0);
+                    b.next.color[2] = (float)((double)((mt.diffuse >> 10) & 31) / 31.0);
+                    pr.has_colors = true;
+                }
+            }
+            b.prim_type = 0;
+            b.prim_start = out.verts.size;
+            bad = _mesh_piece(&b, self.pieces[p0], &pr);
+            _mesh_end_prim(&b);
+            pr.count = out.indices.size - pr.first;
+            out.prims.push(pr);
+        }
+    }
+    if (bad == null) _mesh_weights(&b);
+    b.trie.free();
+    b.terms.free();
+    b.mats.free();
+    b.consts.free();
+    b.vmat.free();
+    if (bad != null) {
+        out.free();
+        return Err<NdsMesh, string>(bad);
+    }
+    return Ok<NdsMesh, string>(out);
 }

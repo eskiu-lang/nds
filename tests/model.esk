@@ -120,7 +120,7 @@ void model() {
     int n = split(&list, w, 512);
     int[2] seen = {0, 0};
     bool ok = true;
-    for (int k = 4; k + 11 < n + 1; k += 12) {
+    for (int k = 4; k + 11 < n + 1 && strcmp(w[k], "tri") == 0; k += 12) {
         int mat = atoi(w[k + 1]);
         NdsMeshGroup* g = &m.groups.data[mat];
         if (g.material != mat || strcmp(m.materials[mat].texture, w[k + 2]) != 0) ok = false;
@@ -151,6 +151,54 @@ void model() {
         ts.value.free();
     }
     check(!nsbmd_read(d.data, 64).ok, "a truncated model");
+    // materials, nodes and inverse bind matrices
+    NdsMaterial* m0 = &m.materials[0];
+    NdsMaterial* m1 = &m.materials[1];
+    check(m0.diffuse == 0x1F && m0.ambient == 0x3E0 && m0.emission == 0x7C00 && m0.alpha == 31 && !m0.cull_back && m0.cull_front, "material colors and culling");
+    check(m0.width == 8 && m0.height == 16 && (m0.tex_params >> 16 & 3) == 3 && !m0.has_tex_matrix, "material texture state");
+    check(m1.diffuse_is_vertex_color && m1.alpha == 16 && !m1.cull_back && !m1.cull_front && m1.has_tex_matrix && m1.tex_scale[0] == 2.0 && m1.tex_scale[1] == 0.5, "material texture matrix");
+    check(m.nnodes == 3 && strcmp(m.nodes[1].name, "arm") == 0 && m.ninv == 3, "nodes");
+    NdsNode* arm = &m.nodes[1];
+    check(arm.has_t && arm.has_r && !arm.has_s && arm.t[0] == 2.0 && arm.r[5] == 1.0 && arm.r[7] == -1.0 && arm.matrix.m[12] == 2.0, "pivot rotation node");
+    NdsNode* tip = &m.nodes[2];
+    check(!tip.has_t && tip.has_r && tip.has_s && tip.r[1] == 1.0 && tip.r[3] == -1.0 && tip.s[2] == 2.0 && tip.matrix.m[4] == -2.0, "full rotation node");
+    check(m.inv_binds[0].m[13] == -1.0 && m.inv_binds[1].m[9] == 1.0 && m.inv_binds[1].m[14] == 1.0, "inverse bind matrices");
+    check(nsbmd_count(d.data, d.len) == 1 && !nsbmd_open(d.data, d.len, 1).ok, "model count");
+    // the posed mesh
+    Result<NdsMesh, string> mr = m.mesh();
+    if (!mr.ok) {
+        check(false, mr.error);
+        return;
+    }
+    NdsMesh me = mr.value;
+    defer me.free();
+    check(me.prims.size == 2 && me.indices.size == 15 && me.verts.size == 11, "mesh primitives");
+    int t = 0;
+    bool same = true;
+    for (int k = 4; k + 11 < n + 1; k += 12) {
+        if (strcmp(w[k], "mesh") != 0) continue;
+        for (j in 0..3) {
+            NdsMeshVertex* v = &me.verts.data[me.indices.data[t * 3 + j]];
+            for (c in 0..3) {
+                if (fabs((double)v.pos[c] - atof(w[k + 3 + j * 3 + c])) > 1e-5) same = false;
+            }
+        }
+        t++;
+    }
+    check(same && t == 5, "mesh positions");
+    // joints: root, then arm under it; the floor follows the root, the wall both
+    check(me.joints.size == 2 && me.joints.data[0].node == 0 && me.joints.data[1].node == 1 && me.joints.data[1].parent == 0, "joints");
+    NdsMeshVertex* f0 = &me.verts.data[0];
+    NdsMeshVertex* w0 = &me.verts.data[5];
+    check(f0.joints[0] == 0 && f0.weights[0] == (float)1.0 && f0.weights[1] == (float)0.0, "floor weights");
+    check(w0.weights[0] == (float)0.5 && w0.weights[1] == (float)0.5 && w0.joints[0] + w0.joints[1] == 1 && me.max_influences == 2 && me.over4 == 0, "wall weights");
+    check(fabs((double)me.joints.data[1].inv_bind.m[14] - 1.0) < 1e-9 && fabs((double)me.joints.data[1].inv_bind.m[12] + 2.0) < 1e-9, "joint inverse bind");
+    check(f0.uv[0] == (float)0.0 && me.verts.data[1].uv[0] == (float)0.5 && me.verts.data[1].uv[1] == (float)0.375 && fabs((double)f0.normal[1] - 1.0) < 1e-6, "mesh texture coordinates and normals");
+    check(me.prims.data[0].has_colors && !me.prims.data[1].has_colors && me.verts.data[5].color[0] == (float)1.0, "vertex colors");
+    float[3] lo;
+    float[3] hi;
+    me.bounds(&lo[0], &hi[0]);
+    check(lo[0] == (float)-4.0 && hi[2] == (float)12.0, "mesh bounds");
 }
 
 textures();
