@@ -1,0 +1,631 @@
+// anim.esk: NitroSystem 3D animations. Joint animations (BCA), texture SRT
+// animations (BTA), texture pattern animations (BTP) and material color
+// animations (BMA), as curves sampled at any frame.
+//
+//     NdsAnimFile a = nds_anim_read(data, len)?;      // BCA0, BTA0, BTP0 or BMA0
+//     defer a.free();
+//     for (i in 0..a.joint.size) {
+//         NdsJointAnim* ja = &a.joint.data[i];
+//         double[3] t;
+//         ja.tracks[0].t_at(10.0, &t[0]);          // node 0's translation at frame 10
+//     }
+//
+// A curve holds samples every 1, 2 or 4 frames (its step) and is read between
+// them by linear interpolation, holding the last sample past the end. A joint
+// track's translation and scale are in model units, its rotation a 3x3 matrix;
+// a part of a node the animation does not move keeps its rest value. Texture
+// SRT values are in texture units (1 is the whole texture); colors and alphas
+// are 0 to 1. Frames run at 60 a second.
+
+import <mem>;
+import <list>;
+import <result>;
+import <math>;
+import <nds/bin>;
+import <nds/model>;
+
+// Curve kinds (NdsCurve.kind): no curve (the part is not animated), one constant value,
+// or samples.
+const int NDS_CURVE_NONE = 0;
+const int NDS_CURVE_CONST = 1;
+const int NDS_CURVE_SAMPLES = 2;
+
+// A curve of values with width components each (3 for a color, 9 for a rotation
+// matrix): count samples, sample i at frame i * step.
+struct NdsCurve {
+    int kind;
+    int step;
+    int count;
+    int width;
+    *double data;
+}
+
+// Frees the samples.
+void NdsCurve_free(NdsCurve* self) {
+    if (self.data != null) free((*void)self.data);
+    self.data = null;
+    self.count = 0;
+    self.kind = NDS_CURVE_NONE;
+}
+
+// The frame of the last sample (0 for a constant or no curve).
+int NdsCurve_last_frame(NdsCurve* self) {
+    if (self.kind != NDS_CURVE_SAMPLES || self.count == 0) return 0;
+    return (self.count - 1) * self.step;
+}
+
+// The value at frame (any real frame) into out (width values); false and nothing
+// written when the curve is NDS_CURVE_NONE.
+bool NdsCurve_at(NdsCurve* self, double frame, double* out) {
+    if (self.kind == NDS_CURVE_NONE || self.count == 0) return false;
+    int w = self.width;
+    if (self.kind == NDS_CURVE_CONST || self.count == 1) {
+        for (k in 0..w) out[k] = self.data[k];
+        return true;
+    }
+    double x = frame / (double)self.step;
+    if (x <= 0.0) x = 0.0;
+    int i = (int)floor(x);
+    if (i >= self.count - 1) {
+        for (k in 0..w) out[k] = self.data[(int64)(self.count - 1) * (int64)w + (int64)k];
+        return true;
+    }
+    double f = x - (double)i;
+    for (k in 0..w) {
+        double a = self.data[(int64)i * (int64)w + (int64)k];
+        double b = self.data[(int64)(i + 1) * (int64)w + (int64)k];
+        out[k] = a + (b - a) * f;
+    }
+    return true;
+}
+
+NdsCurve _curve(int kind, int step, int count, int width) {
+    let c: NdsCurve;
+    c.kind = kind;
+    c.step = step;
+    c.count = count;
+    c.width = width;
+    c.data = alloc<double>((int64)count * (int64)width + 1);
+    return c;
+}
+
+// ---- joint animations (BCA) ----
+
+// The curves of one node: translation x, y, z, rotation (a 3x3 matrix, column-major)
+// and scale x, y, z. animated is false when the animation leaves the node alone.
+struct NdsJointTrack {
+    bool animated;
+    NdsCurve[3] t;
+    NdsCurve r;
+    NdsCurve[3] s;
+}
+
+// The translation at frame into out (3 values); false when no part of it is animated.
+// A part that is not keeps rest[k].
+bool NdsJointTrack_t_at(NdsJointTrack* self, double frame, double* out) {
+    bool any = false;
+    double[9] v;
+    for (k in 0..3) {
+        if (self.t[k].at(frame, &v[0])) {
+            out[k] = v[0];
+            any = true;
+        }
+    }
+    return any;
+}
+
+// The scale at frame into out, as NdsJointTrack_t_at.
+bool NdsJointTrack_s_at(NdsJointTrack* self, double frame, double* out) {
+    bool any = false;
+    double[9] v;
+    for (k in 0..3) {
+        if (self.s[k].at(frame, &v[0])) {
+            out[k] = v[0];
+            any = true;
+        }
+    }
+    return any;
+}
+
+// A joint animation: its name, length in frames and one track per node of the model it
+// is made for.
+struct NdsJointAnim {
+    string name;
+    int frames;
+    int ntracks;
+    *NdsJointTrack tracks;
+}
+
+// ---- texture SRT animations (BTA) ----
+
+// The texture transform curves of one material: scale along s and t, rotation (sine and
+// cosine, width 2) and translation along s and t.
+struct NdsSrtTrack {
+    string material;
+    NdsCurve scale_s;
+    NdsCurve scale_t;
+    NdsCurve rot;
+    NdsCurve trans_s;
+    NdsCurve trans_t;
+}
+
+// A texture SRT animation: its name, length in frames and its materials' tracks.
+struct NdsSrtAnim {
+    string name;
+    int frames;
+    int ntracks;
+    *NdsSrtTrack tracks;
+}
+
+// ---- texture pattern animations (BTP) ----
+
+// A key of a pattern track: from frame on, the material draws with texture and
+// palette (indices of the animation's name lists).
+struct NdsPatternKey {
+    int frame;
+    int texture;
+    int palette;
+}
+
+// The keys of one material.
+struct NdsPatternTrack {
+    string material;
+    int nkeys;
+    *NdsPatternKey keys;
+}
+
+// A texture pattern animation: its name, length, the texture and palette names its keys
+// use, and its materials' tracks.
+struct NdsPatternAnim {
+    string name;
+    int frames;
+    int ntextures;
+    *string textures;
+    int npalettes;
+    *string palettes;
+    int ntracks;
+    *NdsPatternTrack tracks;
+}
+
+// The key in effect at frame (the last one at or before it, else the first); -1 when
+// the track has no keys.
+int NdsPatternTrack_key_at(NdsPatternTrack* self, int frame) {
+    if (self.nkeys == 0) return -1;
+    int k = 0;
+    for (i in 0..self.nkeys) {
+        if (self.keys[i].frame <= frame) k = i;
+    }
+    return k;
+}
+
+// ---- material color animations (BMA) ----
+
+// The color curves of one material: diffuse, ambient, specular and emission (width 3,
+// 0 to 1) and the polygon alpha (width 1, 0 to 1).
+struct NdsColorTrack {
+    string material;
+    NdsCurve diffuse;
+    NdsCurve ambient;
+    NdsCurve specular;
+    NdsCurve emission;
+    NdsCurve alpha;
+}
+
+// A material color animation: its name, length and its materials' tracks.
+struct NdsColorAnim {
+    string name;
+    int frames;
+    int ntracks;
+    *NdsColorTrack tracks;
+}
+
+// The animations of a BCA0, BTA0, BTP0 or BMA0 file. kind is the file's magic; only the
+// matching list is filled. Free with free().
+struct NdsAnimFile {
+    string kind;
+    List<NdsJointAnim> joint;
+    List<NdsSrtAnim> srt;
+    List<NdsPatternAnim> pattern;
+    List<NdsColorAnim> color;
+}
+
+// Frees every animation, its names and curves.
+void NdsAnimFile_free(NdsAnimFile* self) {
+    for (i in 0..self.joint.size) {
+        NdsJointAnim* a = &self.joint.data[i];
+        free((*void)a.name);
+        for (k in 0..a.ntracks) {
+            NdsJointTrack* t = &a.tracks[k];
+            for (c in 0..3) {
+                t.t[c].free();
+                t.s[c].free();
+            }
+            t.r.free();
+        }
+        if (a.tracks != null) free((*void)a.tracks);
+    }
+    for (i in 0..self.srt.size) {
+        NdsSrtAnim* a = &self.srt.data[i];
+        free((*void)a.name);
+        for (k in 0..a.ntracks) {
+            NdsSrtTrack* t = &a.tracks[k];
+            free((*void)t.material);
+            t.scale_s.free();
+            t.scale_t.free();
+            t.rot.free();
+            t.trans_s.free();
+            t.trans_t.free();
+        }
+        if (a.tracks != null) free((*void)a.tracks);
+    }
+    for (i in 0..self.pattern.size) {
+        NdsPatternAnim* a = &self.pattern.data[i];
+        free((*void)a.name);
+        for (k in 0..a.ntextures) free((*void)a.textures[k]);
+        for (k in 0..a.npalettes) free((*void)a.palettes[k]);
+        if (a.textures != null) free((*void)a.textures);
+        if (a.palettes != null) free((*void)a.palettes);
+        for (k in 0..a.ntracks) {
+            free((*void)a.tracks[k].material);
+            if (a.tracks[k].keys != null) free((*void)a.tracks[k].keys);
+        }
+        if (a.tracks != null) free((*void)a.tracks);
+    }
+    for (i in 0..self.color.size) {
+        NdsColorAnim* a = &self.color.data[i];
+        free((*void)a.name);
+        for (k in 0..a.ntracks) {
+            NdsColorTrack* t = &a.tracks[k];
+            free((*void)t.material);
+            t.diffuse.free();
+            t.ambient.free();
+            t.specular.free();
+            t.emission.free();
+            t.alpha.free();
+        }
+        if (a.tracks != null) free((*void)a.tracks);
+    }
+    if (self.joint.data != null) self.joint.free();
+    if (self.srt.data != null) self.srt.free();
+    if (self.pattern.data != null) self.pattern.free();
+    if (self.color.data != null) self.color.free();
+}
+
+// The entries of the Nitro dictionary at off: names into names (copies) and the offset of
+// each entry's data into data; -1 when it does not fit or its entries are not unit bytes.
+int _anim_dict(NdsData* d, int64 off, int unit, *string* names, *int64* data) {
+    *names = null;
+    *data = null;
+    if (!d.has(off, 8)) return -1;
+    int n = d.u8(off + 1);
+    int64 e = off + 12 + 4 * (int64)n;
+    if (!d.has(e, 4) || d.u16(e) != unit) return -1;
+    int64 nm = e + d.u16(e + 2);
+    if (!d.has(e + 4, (int64)n * (int64)unit) || !d.has(nm, (int64)n * 16)) return -1;
+    *string ns = alloc<string>((int64)n + 1);
+    *int64 ds = alloc<int64>((int64)n + 1);
+    for (i in 0..n) {
+        ns[i] = d.str(nm + (int64)i * 16, 16);
+        ds[i] = e + 4 + (int64)i * (int64)unit;
+    }
+    *names = ns;
+    *data = ds;
+    return n;
+}
+
+void _anim_dict_free(*string names, *int64 data, int n) {
+    if (names != null) {
+        for (i in 0..n) free((*void)names[i]);
+        free((*void)names);
+    }
+    if (data != null) free((*void)data);
+}
+
+int _anim_count(int nframes, int shift) {
+    if (shift == 0) return nframes;
+    return (nframes >> shift) + 1;
+}
+
+// A BCA rotation: index i, from the pivot table (bit 15) or the packed basis table.
+void _bca_rot(NdsData* d, int64 pivot, int64 basis, int v, double* out) {
+    int idx = v & 0x7FFF;
+    if ((v & 0x8000) != 0) {
+        int64 o = pivot + (int64)idx * 6;
+        int sn = d.u16(o);
+        nds_pivot_matrix(sn & 15, (sn >> 4) & 15, (double)d.s16(o + 2) / 4096.0, (double)d.s16(o + 4) / 4096.0, out);
+    } else {
+        nds_basis_matrix(d, basis + (int64)idx * 10, out);
+    }
+}
+
+// Reads a BCA translation or scale curve at *p (pairs: two values a sample, the first
+// kept).
+NdsCurve _bca_vec(NdsData* d, int64 a, int64* p, bool is_const, bool pairs) {
+    if (is_const) {
+        NdsCurve c = _curve(NDS_CURVE_CONST, 1, 1, 1);
+        c.data[0] = (double)d.s32(*p) / 4096.0;
+        *p = *p + (pairs ? 8 : 4);
+        return c;
+    }
+    int64 info = d.u32(*p);
+    int64 off = d.u32(*p + 4);
+    *p = *p + 8;
+    int start = (int)(info & 0xFFFF);
+    int end = (int)((info >> 16) & 0x1FFF);
+    bool half = ((info >> 29) & 1) != 0;
+    int shift = (int)((info >> 30) & 3);
+    int n = end > start ? _anim_count(end - start, shift) : 0;
+    NdsCurve c = _curve(NDS_CURVE_SAMPLES, 1 << shift, n, 1);
+    int64 es = (half ? 2 : 4) * (pairs ? 2 : 1);
+    for (i in 0..n) {
+        int64 o = a + off + (int64)i * es;
+        c.data[i] = half ? (double)d.s16(o) / 4096.0 : (double)d.s32(o) / 4096.0;
+    }
+    return c;
+}
+
+string _bca_read(NdsData* d, int64 a, NdsJointAnim* ja) {
+    if (!d.has(a, 0x14) || !d.magic(a, "J\0AC")) return "bca: not a joint animation";
+    ja.frames = d.u16(a + 4);
+    int n = d.u16(a + 6);
+    int64 pivot = a + d.u32(a + 12);
+    int64 basis = a + d.u32(a + 16);
+    if (!d.has(a + 0x14, (int64)n * 2)) return "bca: truncated";
+    ja.ntracks = n;
+    ja.tracks = alloc<NdsJointTrack>((int64)n + 1);
+    for (i in 0..n) {
+        NdsJointTrack* t = &ja.tracks[i];
+        int64 o = a + d.u16(a + 0x14 + (int64)i * 2);
+        int fl = d.u16(o);
+        int64 p = o + 4;
+        if ((fl & 1) != 0) continue;
+        t.animated = true;
+        if (((fl >> 1) & 3) == 0) {
+            for (k in 0..3) t.t[k] = _bca_vec(d, a, &p, ((fl >> (3 + k)) & 1) != 0, false);
+        }
+        if (((fl >> 6) & 3) == 0) {
+            if (((fl >> 8) & 1) != 0) {
+                t.r = _curve(NDS_CURVE_CONST, 1, 1, 9);
+                _bca_rot(d, pivot, basis, d.u16(p), t.r.data);
+                p += 4;
+            } else {
+                int64 info = d.u32(p);
+                int64 off = d.u32(p + 4);
+                p += 8;
+                int start = (int)(info & 0xFFFF);
+                int end = (int)((info >> 16) & 0x1FFF);
+                int shift = (int)((info >> 30) & 3);
+                int cn = end > start ? _anim_count(end - start, shift) : 0;
+                t.r = _curve(NDS_CURVE_SAMPLES, 1 << shift, cn, 9);
+                for (s in 0..cn) _bca_rot(d, pivot, basis, d.u16(a + off + (int64)s * 2), t.r.data + (int64)s * 9);
+            }
+        }
+        if (((fl >> 9) & 3) == 0) {
+            for (k in 0..3) t.s[k] = _bca_vec(d, a, &p, ((fl >> (11 + k)) & 1) != 0, true);
+        }
+    }
+    return null;
+}
+
+// ---- BTA, BMA, BTP ----
+
+// A BTA channel (8 bytes at e): rotation channels hold sine and cosine pairs.
+NdsCurve _bta_channel(NdsData* d, int64 a, int64 e, bool rot) {
+    int nf = d.u16(e);
+    int fl = d.u8(e + 3);
+    int64 v = d.u32(e + 4);
+    bool half = (fl & 0x10) != 0;
+    if ((fl & 0x20) != 0) {
+        NdsCurve c = _curve(NDS_CURVE_CONST, 1, 1, rot ? 2 : 1);
+        if (rot) {
+            c.data[0] = (double)(int)(int16)(uint16)(v & 0xFFFF) / 4096.0;
+            c.data[1] = (double)(int)(int16)(uint16)((v >> 16) & 0xFFFF) / 4096.0;
+        } else {
+            c.data[0] = half ? (double)(int)(int16)(uint16)(v & 0xFFFF) / 4096.0 : (double)(int)(uint32)v / 4096.0;
+        }
+        return c;
+    }
+    int shift = (fl >> 6) & 3;
+    int n = _anim_count(nf, shift);
+    NdsCurve c = _curve(NDS_CURVE_SAMPLES, 1 << shift, n, rot ? 2 : 1);
+    for (i in 0..n) {
+        if (rot) {
+            int64 o = a + v + (int64)i * 4;
+            c.data[i * 2] = (double)d.s16(o) / 4096.0;
+            c.data[i * 2 + 1] = (double)d.s16(o + 2) / 4096.0;
+        } else if (half) {
+            c.data[i] = (double)d.s16(a + v + (int64)i * 2) / 4096.0;
+        } else {
+            c.data[i] = (double)d.s32(a + v + (int64)i * 4) / 4096.0;
+        }
+    }
+    return c;
+}
+
+// A BMA channel (4 bytes at e): a color (3 values) or an alpha.
+NdsCurve _bma_channel(NdsData* d, int64 a, int64 e, bool alpha) {
+    int64 x = d.u32(e);
+    int v = (int)(x & 0xFFFF);
+    int nf = (int)((x >> 16) & 0x1FFF);
+    int w = alpha ? 1 : 3;
+    if (((x >> 29) & 1) != 0) {
+        NdsCurve c = _curve(NDS_CURVE_CONST, 1, 1, w);
+        if (alpha) {
+            c.data[0] = (double)(v & 31) / 31.0;
+        } else {
+            for (k in 0..3) c.data[k] = (double)((v >> (k * 5)) & 31) / 31.0;
+        }
+        return c;
+    }
+    int shift = (int)((x >> 30) & 3);
+    int n = _anim_count(nf, shift);
+    NdsCurve c = _curve(NDS_CURVE_SAMPLES, 1 << shift, n, w);
+    for (i in 0..n) {
+        if (alpha) {
+            c.data[i] = (double)(d.u8(a + (int64)v + (int64)i) & 31) / 31.0;
+        } else {
+            int col = d.u16(a + (int64)v + (int64)i * 2);
+            for (k in 0..3) c.data[i * 3 + k] = (double)((col >> (k * 5)) & 31) / 31.0;
+        }
+    }
+    return c;
+}
+
+string _bta_read(NdsData* d, int64 a, NdsSrtAnim* sa) {
+    if (!d.has(a, 8)) return "bta: truncated";
+    sa.frames = d.u16(a + 4);
+    *string names = null;
+    *int64 data = null;
+    int n = _anim_dict(d, a + 8, 40, &names, &data);
+    if (n < 0) return "bta: bad material dictionary";
+    sa.ntracks = n;
+    sa.tracks = alloc<NdsSrtTrack>((int64)n + 1);
+    for (i in 0..n) {
+        NdsSrtTrack* t = &sa.tracks[i];
+        t.material = names[i];
+        names[i] = null;
+        t.scale_s = _bta_channel(d, a, data[i], false);
+        t.scale_t = _bta_channel(d, a, data[i] + 8, false);
+        t.rot = _bta_channel(d, a, data[i] + 16, true);
+        t.trans_s = _bta_channel(d, a, data[i] + 24, false);
+        t.trans_t = _bta_channel(d, a, data[i] + 32, false);
+    }
+    free((*void)names);
+    free((*void)data);
+    return null;
+}
+
+string _bma_read(NdsData* d, int64 a, NdsColorAnim* ca) {
+    if (!d.has(a, 8)) return "bma: truncated";
+    ca.frames = d.u16(a + 4);
+    *string names = null;
+    *int64 data = null;
+    int n = _anim_dict(d, a + 8, 20, &names, &data);
+    if (n < 0) return "bma: bad material dictionary";
+    ca.ntracks = n;
+    ca.tracks = alloc<NdsColorTrack>((int64)n + 1);
+    for (i in 0..n) {
+        NdsColorTrack* t = &ca.tracks[i];
+        t.material = names[i];
+        names[i] = null;
+        t.diffuse = _bma_channel(d, a, data[i], false);
+        t.ambient = _bma_channel(d, a, data[i] + 4, false);
+        t.specular = _bma_channel(d, a, data[i] + 8, false);
+        t.emission = _bma_channel(d, a, data[i] + 12, false);
+        t.alpha = _bma_channel(d, a, data[i] + 16, true);
+    }
+    free((*void)names);
+    free((*void)data);
+    return null;
+}
+
+string _btp_read(NdsData* d, int64 a, NdsPatternAnim* pa) {
+    if (!d.has(a, 12)) return "btp: truncated";
+    pa.frames = d.u16(a + 4);
+    pa.ntextures = d.u8(a + 6);
+    pa.npalettes = d.u8(a + 7);
+    int64 to = a + d.u16(a + 8);
+    int64 po = a + d.u16(a + 10);
+    pa.textures = alloc<string>((int64)pa.ntextures + 1);
+    pa.palettes = alloc<string>((int64)pa.npalettes + 1);
+    for (i in 0..pa.ntextures) pa.textures[i] = d.str(to + (int64)i * 16, 16);
+    for (i in 0..pa.npalettes) pa.palettes[i] = d.str(po + (int64)i * 16, 16);
+    *string names = null;
+    *int64 data = null;
+    int n = _anim_dict(d, a + 12, 8, &names, &data);
+    if (n < 0) return "btp: bad material dictionary";
+    pa.ntracks = n;
+    pa.tracks = alloc<NdsPatternTrack>((int64)n + 1);
+    string err = null;
+    for (i in 0..n) {
+        NdsPatternTrack* t = &pa.tracks[i];
+        t.material = names[i];
+        names[i] = null;
+        int nk = d.u16(data[i]);
+        int64 ko = a + d.u16(data[i] + 6);
+        t.keys = alloc<NdsPatternKey>((int64)nk + 1);
+        t.nkeys = nk;
+        for (k in 0..nk) {
+            t.keys[k].frame = d.u16(ko + (int64)k * 4);
+            t.keys[k].texture = d.u8(ko + (int64)k * 4 + 2);
+            t.keys[k].palette = d.u8(ko + (int64)k * 4 + 3);
+            if (t.keys[k].texture >= pa.ntextures || (pa.npalettes > 0 && t.keys[k].palette >= pa.npalettes)) err = "btp: a key names a missing texture or palette";
+        }
+    }
+    free((*void)names);
+    free((*void)data);
+    return err;
+}
+
+// The animations of a BCA0, BTA0, BTP0 or BMA0 file (its JNT0, SRT0, PAT0 or MAT0 block).
+Result<NdsAnimFile, string> nds_anim_read(*uint8 data, int64 len) {
+    NdsData dd = NdsData{data: data, len: len};
+    NdsData* d = &dd;
+    let r: NdsAnimFile;
+    string blk = null;
+    if (d.magic(0, "BCA0")) {
+        r.kind = "BCA0";
+        blk = "JNT0";
+    } else if (d.magic(0, "BTA0")) {
+        r.kind = "BTA0";
+        blk = "SRT0";
+    } else if (d.magic(0, "BTP0")) {
+        r.kind = "BTP0";
+        blk = "PAT0";
+    } else if (d.magic(0, "BMA0")) {
+        r.kind = "BMA0";
+        blk = "MAT0";
+    } else {
+        return Err<NdsAnimFile, string>("anim: not a BCA0, BTA0, BTP0 or BMA0 file");
+    }
+    r.joint.init(2);
+    r.srt.init(2);
+    r.pattern.init(2);
+    r.color.init(2);
+    int64 b = nds_block(d, blk);
+    if (b < 0) {
+        r.free();
+        return Err<NdsAnimFile, string>("anim: no animation block");
+    }
+    *string names = null;
+    *int64 offs = null;
+    int n = _anim_dict(d, b + 8, 4, &names, &offs);
+    if (n < 0) {
+        r.free();
+        return Err<NdsAnimFile, string>("anim: bad animation dictionary");
+    }
+    string err = null;
+    for (i in 0..n) {
+        int64 a = b + d.u32(offs[i]);
+        string nm = names[i];
+        names[i] = null;
+        if (blk[0] == 'J') {
+            let ja: NdsJointAnim;
+            ja.name = nm;
+            err = _bca_read(d, a, &ja);
+            r.joint.push(ja);
+        } else if (blk[0] == 'S') {
+            let sa: NdsSrtAnim;
+            sa.name = nm;
+            err = _bta_read(d, a, &sa);
+            r.srt.push(sa);
+        } else if (blk[0] == 'P') {
+            let pa: NdsPatternAnim;
+            pa.name = nm;
+            err = _btp_read(d, a, &pa);
+            r.pattern.push(pa);
+        } else {
+            let ca: NdsColorAnim;
+            ca.name = nm;
+            err = _bma_read(d, a, &ca);
+            r.color.push(ca);
+        }
+        if (err != null) break;
+    }
+    _anim_dict_free(names, offs, n);
+    if (err != null) {
+        r.free();
+        return Err<NdsAnimFile, string>(err);
+    }
+    return Ok<NdsAnimFile, string>(r);
+}
