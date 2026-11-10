@@ -1480,6 +1480,315 @@ const float _SD_32768 = 32768.0;
 const float _SD_32767 = 32767.0;
 const float _SD_MINUS_ONE = -1.0;
 
+// The voices are mixed a span at a time: the samples up to the next driver
+// frame, where no setting changes. Each voice adds its whole span to a stereo
+// block before the next voice starts, in a loop made for its kind of wave.
+// Every output sample still sums the voices in order from zero, and each
+// voice's value rounds as it would one sample at a time, so the result is the
+// same to the bit.
+
+// A PCM voice during one span, in locals the loops keep in registers. The
+// gains are divided by 32768 up front, which takes a multiplication out of
+// each sample and does not change the result: dividing by a power of two is
+// exact at these magnitudes, so (x / 32768) * g and x * (g / 32768) round the
+// same. (float)(b - a) for two 16-bit samples is (float)b - (float)a exactly.
+struct _SdRun {
+    *int16 pcm;
+    SdatWave* smp;
+    double end;
+    double inner;
+    double pos;
+    double step;
+    float gl;
+    float gr;
+    bool on;
+}
+
+void _sd_run_start(_SdRun* r, SdatWave* smp, _SdVoice* v) {
+    r.pcm = smp.pcm;
+    r.smp = smp;
+    r.end = (double)smp.len;
+    // below this position the next sample is in the wave, so no check is needed
+    r.inner = (double)(smp.len - 1);
+    r.pos = v.pos;
+    r.step = v.step;
+    r.gl = v.gain_l / _SD_32768;
+    r.gr = v.gain_r / _SD_32768;
+    r.on = true;
+}
+
+void _sd_run_end(_SdRun* r, _SdVoice* v) {
+    v.pos = r.pos;
+    if (!r.on) {
+        v.gain_l = _SD_ZERO;
+        v.gain_r = _SD_ZERO;
+    }
+}
+
+// One sample of r added to a[0] and a[1], with every check: the end of the
+// wave, its loop and the last sample. A voice past the end of a wave that
+// does not loop stays silent and stops (r.on is false).
+void _sd_run_one(_SdRun* r, *float a) {
+    if (!r.on) return;
+    SdatWave* smp = r.smp;
+    int64 len = smp.len;
+    if (r.pos >= r.end) {
+        if (!smp.looped || len <= smp.loop_start + 1) {
+            r.on = false;
+            return;
+        }
+        double span = (double)(len - smp.loop_start);
+        r.pos = (double)smp.loop_start + fmod(r.pos - r.end, span);
+    }
+    int64 q = (int64)r.pos;
+    float fr = (float)(r.pos - (double)q);
+    int ai = (int)r.pcm[q];
+    int bi = ai;
+    if (q + 1 < len) {
+        bi = (int)r.pcm[q + 1];
+    } else if (smp.looped) {
+        bi = (int)r.pcm[smp.loop_start];
+    }
+    float s = (float)ai + (float)(bi - ai) * fr;
+    a[0] += s * r.gl;
+    a[1] += s * r.gr;
+    r.pos += r.step;
+}
+
+// How many more samples r can take from where it is with the next sample
+// still in the wave (below r.inner), so the loops below need no check. Each
+// addition of the step rounds by at most half an ulp of the position, which
+// the bound allows for twice over.
+int64 _sd_run_room(_SdRun* r, int64 most) {
+    double room = r.inner - r.pos;
+    if (!(room > 0.0)) return 0;
+    double x = room / (r.step + r.inner * 2.220446049250313e-16);
+    if (!(x < (double)most)) return most;
+    int64 k = (int64)x - 1;
+    if (k < 0) k = 0;
+    return k;
+}
+
+// Adds m samples of r to the stereo block acc.
+void _sd_mix1(_SdRun* r, *float acc, int64 m) {
+    *int16 pcm = r.pcm;
+    double step = r.step;
+    float gl = r.gl;
+    float gr = r.gr;
+    int64 j = 0;
+    while (j < m && r.on) {
+        int64 fast = _sd_run_room(r, m - j);
+        if (fast == 0) {
+            _sd_run_one(r, acc + j * 2);
+            j++;
+            continue;
+        }
+        double pos = r.pos;
+        for (int64 e = j + fast; j < e; j++) {
+            int64 q = (int64)pos;
+            float fr = (float)(pos - (double)q);
+            int ai = (int)pcm[q];
+            float s = (float)ai + (float)((int)pcm[q + 1] - ai) * fr;
+            acc[j * 2] += s * gl;
+            acc[j * 2 + 1] += s * gr;
+            pos += step;
+        }
+        r.pos = pos;
+    }
+}
+
+// Adds m samples of r0 and then r1 to acc. Two voices in one loop keep two
+// independent chains of positions in flight; each sample still gets r0's
+// value before r1's.
+void _sd_mix2(_SdRun* r0, _SdRun* r1, *float acc, int64 m) {
+    *int16 pcm0 = r0.pcm;
+    *int16 pcm1 = r1.pcm;
+    double step0 = r0.step;
+    double step1 = r1.step;
+    float gl0 = r0.gl;
+    float gr0 = r0.gr;
+    float gl1 = r1.gl;
+    float gr1 = r1.gr;
+    int64 j = 0;
+    while (j < m) {
+        if (!r0.on) {
+            _sd_mix1(r1, acc + j * 2, m - j);
+            return;
+        }
+        if (!r1.on) {
+            _sd_mix1(r0, acc + j * 2, m - j);
+            return;
+        }
+        int64 fast = _sd_run_room(r1, _sd_run_room(r0, m - j));
+        if (fast == 0) {
+            _sd_run_one(r0, acc + j * 2);
+            _sd_run_one(r1, acc + j * 2);
+            j++;
+            continue;
+        }
+        double pos0 = r0.pos;
+        double pos1 = r1.pos;
+        for (int64 e = j + fast; j < e; j++) {
+            int64 q0 = (int64)pos0;
+            int64 q1 = (int64)pos1;
+            float fr0 = (float)(pos0 - (double)q0);
+            float fr1 = (float)(pos1 - (double)q1);
+            int a0 = (int)pcm0[q0];
+            int a1 = (int)pcm1[q1];
+            float s0 = (float)a0 + (float)((int)pcm0[q0 + 1] - a0) * fr0;
+            float s1 = (float)a1 + (float)((int)pcm1[q1 + 1] - a1) * fr1;
+            acc[j * 2] = (acc[j * 2] + s0 * gl0) + s1 * gl1;
+            acc[j * 2 + 1] = (acc[j * 2 + 1] + s0 * gr0) + s1 * gr1;
+            pos0 += step0;
+            pos1 += step1;
+        }
+        r0.pos = pos0;
+        r1.pos = pos1;
+    }
+}
+
+// Adds m samples of the voices of rs that are still on, in order, to acc.
+void _sd_mix_list(*_SdRun rs, int cnt, *float acc, int64 m) {
+    int k = 0;
+    while (k < cnt) {
+        if (!rs[k].on) {
+            k++;
+            continue;
+        }
+        int k2 = k + 1;
+        while (k2 < cnt && !rs[k2].on) k2++;
+        if (k2 < cnt) {
+            _sd_mix2(&rs[k], &rs[k2], acc, m);
+            k = k2 + 1;
+        } else {
+            _sd_mix1(&rs[k], acc, m);
+            k = cnt;
+        }
+    }
+}
+
+// Adds m samples of the four voices rs[0..4] to acc, in that order.
+void _sd_mix4(*_SdRun rs, *float acc, int64 m) {
+    *int16 pcm0 = rs[0].pcm;
+    *int16 pcm1 = rs[1].pcm;
+    *int16 pcm2 = rs[2].pcm;
+    *int16 pcm3 = rs[3].pcm;
+    double step0 = rs[0].step;
+    double step1 = rs[1].step;
+    double step2 = rs[2].step;
+    double step3 = rs[3].step;
+    float gl0 = rs[0].gl;
+    float gr0 = rs[0].gr;
+    float gl1 = rs[1].gl;
+    float gr1 = rs[1].gr;
+    float gl2 = rs[2].gl;
+    float gr2 = rs[2].gr;
+    float gl3 = rs[3].gl;
+    float gr3 = rs[3].gr;
+    int64 j = 0;
+    while (j < m) {
+        if (!rs[0].on || !rs[1].on || !rs[2].on || !rs[3].on) {
+            _sd_mix_list(rs, 4, acc + j * 2, m - j);
+            return;
+        }
+        int64 fast = m - j;
+        for (k in 0..4) fast = _sd_run_room(&rs[k], fast);
+        if (fast == 0) {
+            for (k in 0..4) _sd_run_one(&rs[k], acc + j * 2);
+            j++;
+            continue;
+        }
+        double pos0 = rs[0].pos;
+        double pos1 = rs[1].pos;
+        double pos2 = rs[2].pos;
+        double pos3 = rs[3].pos;
+        for (int64 e = j + fast; j < e; j++) {
+            int64 q0 = (int64)pos0;
+            int64 q1 = (int64)pos1;
+            int64 q2 = (int64)pos2;
+            int64 q3 = (int64)pos3;
+            float fr0 = (float)(pos0 - (double)q0);
+            float fr1 = (float)(pos1 - (double)q1);
+            float fr2 = (float)(pos2 - (double)q2);
+            float fr3 = (float)(pos3 - (double)q3);
+            int a0 = (int)pcm0[q0];
+            int a1 = (int)pcm1[q1];
+            int a2 = (int)pcm2[q2];
+            int a3 = (int)pcm3[q3];
+            float s0 = (float)a0 + (float)((int)pcm0[q0 + 1] - a0) * fr0;
+            float s1 = (float)a1 + (float)((int)pcm1[q1 + 1] - a1) * fr1;
+            float s2 = (float)a2 + (float)((int)pcm2[q2 + 1] - a2) * fr2;
+            float s3 = (float)a3 + (float)((int)pcm3[q3 + 1] - a3) * fr3;
+            acc[j * 2] = (((acc[j * 2] + s0 * gl0) + s1 * gl1) + s2 * gl2) + s3 * gl3;
+            acc[j * 2 + 1] = (((acc[j * 2 + 1] + s0 * gr0) + s1 * gr1) + s2 * gr2) + s3 * gr3;
+            pos0 += step0;
+            pos1 += step1;
+            pos2 += step2;
+            pos3 += step3;
+        }
+        rs[0].pos = pos0;
+        rs[1].pos = pos1;
+        rs[2].pos = pos2;
+        rs[3].pos = pos3;
+    }
+}
+
+// Adds m samples of the PSG square wave voice v to acc.
+void _sd_mix_psg(_SdVoice* v, *float acc, int64 m) {
+    double pos = v.pos;
+    double step = v.step;
+    float gl = v.gain_l;
+    float gr = v.gain_r;
+    // 8 steps a cycle; duty d is d + 1 high steps (7 is silence)
+    int duty = v.zone.duty & 7;
+    for (int64 j = 0; j < m; j++) {
+        int stepi = (int)(int64)pos & 7;
+        float s = _SD_PSG_LO;
+        if (duty == 7) {
+            s = _SD_ZERO;
+        } else if (stepi >= 7 - duty) {
+            s = _SD_PSG_HI;
+        }
+        pos += step;
+        if (pos >= 8.0) pos = fmod(pos, 8.0);
+        acc[j * 2] += s * gl;
+        acc[j * 2 + 1] += s * gr;
+    }
+    v.pos = pos;
+}
+
+// Adds m samples of the noise voice v to acc.
+void _sd_mix_noise(_SdVoice* v, *float acc, int64 m) {
+    double pos = v.pos;
+    double step = v.step;
+    float gl = v.gain_l;
+    float gr = v.gain_r;
+    int lfsr = v.lfsr;
+    float noise = v.noise;
+    for (int64 j = 0; j < m; j++) {
+        int64 before = (int64)pos;
+        int64 after = (int64)(pos + step);
+        // the LFSR repeats every 32767 steps: a huge step (a corrupt pitch)
+        // runs only what changes the result
+        if (after - before > 65534) before = after - 32767 - (after - before) % 32767;
+        for (int64 c = before; c < after; c++) {
+            if ((lfsr & 1) != 0) {
+                lfsr = (lfsr >> 1) ^ 0x6000;
+                noise = _SD_PSG_LO;
+            } else {
+                lfsr = lfsr >> 1;
+                noise = _SD_PSG_HI;
+            }
+        }
+        pos += step;
+        acc[j * 2] += noise * gl;
+        acc[j * 2 + 1] += noise * gr;
+    }
+    v.pos = pos;
+    v.lfsr = lfsr;
+    v.noise = noise;
+}
+
 // Renders up to n frames (stereo pairs) into out as floats in -1..1, left
 // first. Returns how many it wrote: fewer than n once the sequence ends.
 // Any block size gives the same output.
@@ -1493,77 +1802,54 @@ int64 SdatPlayer_render_f32(SdatPlayer* self, *float out, int64 n) {
             _sd_frame(p);
             p.frame_left += spf;
         }
-        float l = _SD_ZERO;
-        float r = _SD_ZERO;
-        for (k in 0..p.nvoices) {
-            _SdVoice* v = &p.voices[k];
-            float s = _SD_ZERO;
-            int wave = v.zone.wave;
-            if (wave == _SD_PCM) {
-                SdatWave* smp = &p.bank.samples.data[v.zone.sample];
-                int64 len = smp.len;
-                if (v.pos >= (double)len) {
-                    if (!smp.looped || len <= smp.loop_start + 1) {
-                        v.gain_l = _SD_ZERO;
-                        v.gain_r = _SD_ZERO;
-                        continue;
-                    }
-                    double span = (double)(len - smp.loop_start);
-                    v.pos = (double)smp.loop_start + fmod(v.pos - (double)len, span);
-                }
-                int64 q = (int64)v.pos;
-                float fr = (float)(v.pos - (double)q);
-                float a = (float)smp.pcm[q];
-                float b = a;
-                if (q + 1 < len) {
-                    b = (float)smp.pcm[q + 1];
-                } else if (smp.looped) {
-                    b = (float)smp.pcm[smp.loop_start];
-                }
-                s = (a + (b - a) * fr) / _SD_32768;
-            } else if (wave == _SD_PSG) {
-                // 8 steps a cycle; duty d is d + 1 high steps (7 is silence)
-                int stepi = (int)(int64)v.pos & 7;
-                int duty = v.zone.duty & 7;
-                if (duty == 7) {
-                    s = _SD_ZERO;
-                } else if (stepi >= 7 - duty) {
-                    s = _SD_PSG_HI;
-                } else {
-                    s = _SD_PSG_LO;
-                }
-            } else {
-                int64 before = (int64)v.pos;
-                int64 after = (int64)(v.pos + v.step);
-                // the LFSR repeats every 32767 steps: a huge step (a corrupt
-                // pitch) runs only what changes the result
-                if (after - before > 65534) before = after - 32767 - (after - before) % 32767;
-                for (int64 c = before; c < after; c++) {
-                    if ((v.lfsr & 1) != 0) {
-                        v.lfsr = (v.lfsr >> 1) ^ 0x6000;
-                        v.noise = _SD_PSG_LO;
-                    } else {
-                        v.lfsr = v.lfsr >> 1;
-                        v.noise = _SD_PSG_HI;
-                    }
-                }
-                s = v.noise;
-            }
-            v.pos += v.step;
-            if (wave == _SD_PSG && v.pos >= 8.0) v.pos = fmod(v.pos, 8.0);
-            l += s * v.gain_l;
-            r += s * v.gain_r;
+        // frame_left drops by one a sample and the next frame comes once it
+        // is not positive. Down to 1 each subtraction is exact, so the span is
+        // its ceiling and only the last subtraction can round.
+        double left = p.frame_left;
+        int64 m = 1;
+        if (left > 0.0) {
+            m = (int64)left;
+            if ((double)m < left) m++;
         }
-        float ol = l * _SD_HALF;
-        float or_ = r * _SD_HALF;
-        if (ol < _SD_MINUS_ONE) ol = _SD_MINUS_ONE;
-        if (ol > _SD_ONE) ol = _SD_ONE;
-        if (or_ < _SD_MINUS_ONE) or_ = _SD_MINUS_ONE;
-        if (or_ > _SD_ONE) or_ = _SD_ONE;
-        out[i * 2] = ol;
-        out[i * 2 + 1] = or_;
-        i++;
-        p.frame_left -= 1.0;
+        if (m > n - i) m = n - i;
+        p.frame_left = (left - (double)(m - 1)) - 1.0;
+        *float acc = out + i * 2;
+        for (int64 j = 0; j < m * 2; j++) acc[j] = _SD_ZERO;
+        int k = 0;
+        while (k < p.nvoices) {
+            _SdVoice* v = &p.voices[k];
+            int wave = v.zone.wave;
+            if (wave == _SD_PSG) {
+                _sd_mix_psg(v, acc, m);
+                k++;
+            } else if (wave != _SD_PCM) {
+                _sd_mix_noise(v, acc, m);
+                k++;
+            } else {
+                // up to four PCM voices in a row go through one loop
+                _SdRun[4] rs;
+                int c = 0;
+                while (c < 4 && k + c < p.nvoices && p.voices[k + c].zone.wave == _SD_PCM) {
+                    _SdVoice* w = &p.voices[k + c];
+                    _sd_run_start(&rs[c], &p.bank.samples.data[w.zone.sample], w);
+                    c++;
+                }
+                if (c == 4) {
+                    _sd_mix4(&rs[0], acc, m);
+                } else {
+                    _sd_mix_list(&rs[0], c, acc, m);
+                }
+                for (g in 0..c) _sd_run_end(&rs[g], &p.voices[k + g]);
+                k += c;
+            }
+        }
+        for (int64 j = 0; j < m * 2; j++) {
+            float o = acc[j] * _SD_HALF;
+            if (o < _SD_MINUS_ONE) o = _SD_MINUS_ONE;
+            if (o > _SD_ONE) o = _SD_ONE;
+            acc[j] = o;
+        }
+        i += m;
     }
     return i;
 }
