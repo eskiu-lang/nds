@@ -1,0 +1,798 @@
+// spl.esk: SPL particle archives (.spa files, " APS" version "12_1"): the
+// emitters with their animations, child particles and fields, and their
+// textures, read without simulating anything.
+//
+//     NdsSpl s = spl_read(data, len)?;
+//     defer s.free();
+//     for (i in 0..s.nres) {
+//         NdsSplResource* r = &s.res[i];
+//         printf("%d particles of %d frames\n", r.e.gen_count, r.e.particle_life);
+//     }
+//     NdsImage img = s.image(0)?;                   // texture 0 as RGBA
+//     s.write_json("out", "fx")?;                    // out/fx.json, out/fx_0.png, ...
+//
+// Every value is kept as stored: fixed-point numbers are raw integers (4096
+// is 1.0 for scales, speeds and positions), colors are BGR555, alphas 0 to
+// 31 and angles 65536 to a turn. NdsSpl_write_json writes the open particle
+// format of the Tallgrass engine ("tallgrass-spl-1"): the field names and
+// the layout of that format's JSON, each texture as a PNG.
+//
+// The layout was worked out from the files of three games: every resource
+// record and texture of Platinum, HeartGold and Black 2 reads to the same
+// JSON as the engine's converter.
+
+import <mem>;
+import <list>;
+import <string>;
+import <sort>;
+import <fs>;
+import <result>;
+import <nds/bin>;
+import <nds/image>;
+import <nds/model>;
+
+// Emitter shapes (NdsSplEmitter.shape): the point, sphere and circle edges and
+// insides, evenly spaced circle edge, disc, cylinder surface and inside, half sphere.
+const int SPL_SHAPE_POINT = 0;
+const int SPL_SHAPE_SPHERE_SURFACE = 1;
+const int SPL_SHAPE_CIRCLE_EDGE = 2;
+const int SPL_SHAPE_CIRCLE_EDGE_EVEN = 3;
+const int SPL_SHAPE_SPHERE_VOLUME = 4;
+const int SPL_SHAPE_DISC = 5;
+const int SPL_SHAPE_CYLINDER_SURFACE = 6;
+const int SPL_SHAPE_CYLINDER_VOLUME = 7;
+const int SPL_SHAPE_HEMISPHERE_SURFACE = 8;
+
+// Field kinds (NdsSplField.kind), in the order a resource stores them.
+const int SPL_FIELD_GRAVITY = 0;
+const int SPL_FIELD_RANDOM = 1;
+const int SPL_FIELD_MAGNET = 2;
+const int SPL_FIELD_SPIN = 3;
+const int SPL_FIELD_COLLISION = 4;
+const int SPL_FIELD_CONVERGENCE = 5;
+
+// How a particle's scale changes over its life: from start to mid until in_frame,
+// mid until out_frame, then to end (frames in 1/255 of the life). Scales in 1/4096.
+struct NdsSplScaleAnim {
+    int start;
+    int mid;
+    int end;
+    int in_frame;
+    int out_frame;
+    bool loop;
+}
+
+// How a particle's color changes: start until in_frame, to end at peak_frame, back
+// by out_frame (1/255 of the life); random picks start or end, interpolation blends.
+struct NdsSplColorAnim {
+    int start;
+    int end;
+    int in_frame;
+    int peak_frame;
+    int out_frame;
+    bool random;
+    bool loop;
+    bool interpolation;
+}
+
+// How a particle's alpha (0 to 31) changes: start, mid and end with in_frame and
+// out_frame as for scale; flick is a random flicker amount.
+struct NdsSplAlphaAnim {
+    int start;
+    int mid;
+    int end;
+    int flick;
+    bool loop;
+    int in_frame;
+    int out_frame;
+}
+
+// A texture animation: count textures of the archive, frame_step 1/255 of the life
+// each, in order or at random.
+struct NdsSplTexAnim {
+    int[8] textures;
+    int count;
+    int frame_step;
+    bool random;
+    bool loop;
+}
+
+// The child particles a particle emits: gen_count every gen_interval frames from
+// gen_start (in 1/255 of its life), life frames each, with their own color, texture,
+// scale ratio and velocity.
+struct NdsSplChild {
+    int flags;
+    bool affected_by_fields;
+    bool scale_anim;
+    bool alpha_anim;
+    int rotation_type;
+    bool follow_emitter;
+    bool use_child_color;
+    int draw_type;
+    int polygon_rotation_axis;
+    int polygon_base_plane;
+    int init_velocity_random;
+    int end_scale;
+    int life;
+    int velocity_ratio;
+    int scale_ratio;
+    int color;
+    int gen_count;
+    int gen_start;
+    int gen_interval;
+    int texture;
+    int texture_repeat_s;
+    int texture_repeat_t;
+    bool reverse_s;
+    bool reverse_t;
+}
+
+// A field acting on the particles. vec is the gravity or random magnitude, or the
+// magnet or convergence position; a is the random interval, magnet magnitude, spin
+// angle, collision plane height or convergence ratio; b the spin axis or collision
+// bounce; c the collision event type, flag the collision's global flag.
+struct NdsSplField {
+    int kind;
+    int[3] vec;
+    int a;
+    int b;
+    int c;
+    bool flag;
+}
+
+// An emitter: its flag word and the values of its record (see the module comment
+// for units).
+struct NdsSplEmitter {
+    int64 flags;
+    int shape;
+    int draw_type;
+    int circle_axis;
+    int[3] position;
+    int gen_count;
+    int radius;
+    int length;
+    int[3] axis;
+    int color;
+    int init_velocity_from_position;
+    int init_velocity_along_axis;
+    int base_scale;
+    int aspect;
+    int start_frame;
+    int rotation_min;
+    int rotation_max;
+    int initial_rotation;
+    int emitter_life;
+    int particle_life;
+    int random_base_scale;
+    int random_particle_life;
+    int random_init_velocity;
+    int gen_interval;
+    int base_alpha;
+    int air_resistance;
+    int texture;
+    int loop_frame;
+    int directional_scale;
+    int texture_repeat_s;
+    int texture_repeat_t;
+    int scale_anim_direction;
+    bool directional_polygon_center;
+    bool reverse_s;
+    bool reverse_t;
+    int offset_mode;
+    int offset_x;
+    int offset_y;
+}
+
+// A resource: its emitter, the optional animations and child (has_* say which are
+// there) and its fields.
+struct NdsSplResource {
+    NdsSplEmitter e;
+    bool has_scale;
+    NdsSplScaleAnim scale;
+    bool has_color;
+    NdsSplColorAnim color;
+    bool has_alpha;
+    NdsSplAlphaAnim alpha;
+    bool has_tex_anim;
+    NdsSplTexAnim tex_anim;
+    bool has_child;
+    NdsSplChild child;
+    int nfields;
+    NdsSplField[6] fields;
+}
+
+// A texture of the archive: format (NDS_TEX_*), size, repeat, flip and color 0
+// transparency, and where its texels and palette are in the file.
+struct NdsSplTexture {
+    int format;
+    int width;
+    int height;
+    bool repeat_s;
+    bool repeat_t;
+    bool flip_s;
+    bool flip_t;
+    bool color0;
+    int64 data;
+    int64 data_size;
+    int64 palette;
+    int64 palette_size;
+}
+
+// An SPL archive: its resources and textures. The texel data stays in the file's
+// buffer, which must outlive it. Free with free().
+struct NdsSpl {
+    NdsData d;
+    int nres;
+    *NdsSplResource res;
+    int ntex;
+    *NdsSplTexture tex;
+}
+
+// Frees the resource and texture tables.
+void NdsSpl_free(NdsSpl* self) {
+    if (self.res != null) free((*void)self.res);
+    if (self.tex != null) free((*void)self.tex);
+    self.res = null;
+    self.tex = null;
+    self.nres = 0;
+    self.ntex = 0;
+}
+
+int _bits(int64 v, int lo, int n) {
+    return (int)((v >> lo) & (((int64)1 << n) - 1));
+}
+
+void _spl_emitter(NdsData* d, int64 o, NdsSplEmitter* e) {
+    int64 f = d.u32(o);
+    e.flags = f;
+    e.shape = _bits(f, 0, 4);
+    e.draw_type = _bits(f, 4, 2);
+    e.circle_axis = _bits(f, 6, 2);
+    for (k in 0..3) {
+        e.position[k] = d.s32(o + 4 + (int64)k * 4);
+        e.axis[k] = d.s16(o + 28 + (int64)k * 2);
+    }
+    e.gen_count = d.s32(o + 16);
+    e.radius = d.s32(o + 20);
+    e.length = d.s32(o + 24);
+    e.color = d.u16(o + 34);
+    e.init_velocity_from_position = d.s32(o + 36);
+    e.init_velocity_along_axis = d.s32(o + 40);
+    e.base_scale = d.s32(o + 44);
+    e.aspect = d.u16(o + 48);
+    e.start_frame = d.u16(o + 50);
+    e.rotation_min = d.s16(o + 52);
+    e.rotation_max = d.s16(o + 54);
+    e.initial_rotation = d.u16(o + 56);
+    e.emitter_life = d.u16(o + 60);
+    e.particle_life = d.u16(o + 62);
+    e.random_base_scale = d.u8(o + 64);
+    e.random_particle_life = d.u8(o + 65);
+    e.random_init_velocity = d.u8(o + 66);
+    e.gen_interval = d.u8(o + 68);
+    e.base_alpha = d.u8(o + 69);
+    e.air_resistance = d.u8(o + 70);
+    e.texture = d.u8(o + 71);
+    e.loop_frame = d.u8(o + 72);
+    e.directional_scale = d.u8(o + 73) | (d.u8(o + 74) << 8);
+    int b75 = d.u8(o + 75);
+    e.texture_repeat_s = b75 & 3;
+    e.texture_repeat_t = (b75 >> 2) & 3;
+    e.scale_anim_direction = (b75 >> 4) & 3;
+    e.directional_polygon_center = (b75 & 0x80) != 0;
+    int b76 = d.u8(o + 76);
+    e.reverse_s = (b76 & 1) != 0;
+    e.reverse_t = (b76 & 2) != 0;
+    e.offset_mode = (b76 >> 2) & 7;
+    e.offset_x = d.s16(o + 80);
+    e.offset_y = d.s16(o + 82);
+}
+
+// Bytes of each field kind's record.
+int _spl_field_size(int kind) {
+    if (kind == SPL_FIELD_GRAVITY || kind == SPL_FIELD_RANDOM || kind == SPL_FIELD_COLLISION) return 8;
+    if (kind == SPL_FIELD_SPIN) return 4;
+    return 16;
+}
+
+// The archive in data: its resources and textures.
+Result<NdsSpl, string> spl_read(*uint8 data, int64 len) {
+    let s: NdsSpl;
+    s.d = NdsData{data: data, len: len};
+    NdsData* d = &s.d;
+    if (!d.magic(0, " APS")) return Err<NdsSpl, string>("spl: not an SPL archive");
+    if (!d.has(0, 0x20)) return Err<NdsSpl, string>("spl: truncated");
+    if (d.u8(4) != '1' || d.u8(5) != '2') return Err<NdsSpl, string>("spl: unsupported version");
+    s.nres = d.u16(8);
+    s.ntex = d.u16(10);
+    int64 tex_at = d.u32(0x18);
+    if ((int64)s.nres * 88 > len || (int64)s.ntex * 32 > len) return Err<NdsSpl, string>("spl: truncated");
+    s.res = alloc<NdsSplResource>((int64)s.nres + 1);
+    s.tex = alloc<NdsSplTexture>((int64)s.ntex + 1);
+    int64 o = 0x20;
+    for (i in 0..s.nres) {
+        if (!d.has(o, 88)) {
+            s.free();
+            return Err<NdsSpl, string>("spl: resource out of range");
+        }
+        NdsSplResource* r = &s.res[i];
+        _spl_emitter(d, o, &r.e);
+        int64 f = r.e.flags;
+        int64 p = o + 88;
+        if (((f >> 8) & 1) != 0) {
+            r.has_scale = true;
+            r.scale.start = d.u16(p);
+            r.scale.mid = d.u16(p + 2);
+            r.scale.end = d.u16(p + 4);
+            r.scale.in_frame = d.u8(p + 6);
+            r.scale.out_frame = d.u8(p + 7);
+            r.scale.loop = (d.u8(p + 8) & 1) != 0;
+            p += 12;
+        }
+        if (((f >> 9) & 1) != 0) {
+            r.has_color = true;
+            r.color.start = d.u16(p);
+            r.color.end = d.u16(p + 2);
+            r.color.in_frame = d.u8(p + 4);
+            r.color.peak_frame = d.u8(p + 5);
+            r.color.out_frame = d.u8(p + 6);
+            int cf = d.u8(p + 8);
+            r.color.random = (cf & 1) != 0;
+            r.color.loop = (cf & 2) != 0;
+            r.color.interpolation = (cf & 4) != 0;
+            p += 12;
+        }
+        if (((f >> 10) & 1) != 0) {
+            r.has_alpha = true;
+            int av = d.u16(p);
+            r.alpha.start = av & 31;
+            r.alpha.mid = (av >> 5) & 31;
+            r.alpha.end = (av >> 10) & 31;
+            r.alpha.flick = d.u8(p + 2);
+            r.alpha.loop = (d.u8(p + 3) & 1) != 0;
+            r.alpha.in_frame = d.u8(p + 4);
+            r.alpha.out_frame = d.u8(p + 5);
+            p += 8;
+        }
+        if (((f >> 11) & 1) != 0) {
+            r.has_tex_anim = true;
+            for (k in 0..8) r.tex_anim.textures[k] = d.u8(p + (int64)k);
+            r.tex_anim.count = d.u8(p + 8);
+            r.tex_anim.frame_step = d.u8(p + 9);
+            r.tex_anim.random = (d.u8(p + 10) & 1) != 0;
+            r.tex_anim.loop = (d.u8(p + 10) & 2) != 0;
+            p += 12;
+        }
+        if (((f >> 16) & 1) != 0) {
+            r.has_child = true;
+            NdsSplChild* c = &r.child;
+            int cf = d.u16(p);
+            c.flags = cf;
+            c.affected_by_fields = (cf & 1) != 0;
+            c.scale_anim = (cf & 2) != 0;
+            c.alpha_anim = (cf & 4) != 0;
+            c.rotation_type = (cf >> 3) & 3;
+            c.follow_emitter = (cf & 0x20) != 0;
+            c.use_child_color = (cf & 0x40) != 0;
+            c.draw_type = (cf >> 7) & 3;
+            c.polygon_rotation_axis = (cf >> 9) & 3;
+            c.polygon_base_plane = (cf >> 11) & 1;
+            c.init_velocity_random = d.s16(p + 2);
+            c.end_scale = d.u16(p + 4);
+            c.life = d.u16(p + 6);
+            c.velocity_ratio = d.u8(p + 8);
+            c.scale_ratio = d.u8(p + 9);
+            c.color = d.u16(p + 10);
+            c.gen_count = d.u8(p + 12);
+            c.gen_start = d.u8(p + 13);
+            c.gen_interval = d.u8(p + 14);
+            c.texture = d.u8(p + 15);
+            int tf = d.u8(p + 16);
+            c.texture_repeat_s = tf & 3;
+            c.texture_repeat_t = (tf >> 2) & 3;
+            c.reverse_s = (tf & 0x10) != 0;
+            c.reverse_t = (tf & 0x20) != 0;
+            p += 20;
+        }
+        for (k in 0..6) {
+            if (((f >> (24 + k)) & 1) == 0) continue;
+            NdsSplField* fl = &r.fields[r.nfields];
+            r.nfields++;
+            fl.kind = k;
+            if (k == SPL_FIELD_GRAVITY || k == SPL_FIELD_RANDOM) {
+                for (q in 0..3) fl.vec[q] = d.s16(p + (int64)q * 2);
+                fl.a = d.u16(p + 6);
+            } else if (k == SPL_FIELD_MAGNET || k == SPL_FIELD_CONVERGENCE) {
+                for (q in 0..3) fl.vec[q] = d.s32(p + (int64)q * 4);
+                fl.a = k == SPL_FIELD_MAGNET ? d.s16(p + 12) : d.s16(p + 12);
+            } else if (k == SPL_FIELD_SPIN) {
+                fl.a = d.u16(p);
+                fl.b = d.u16(p + 2);
+            } else {
+                fl.a = d.s32(p);
+                fl.b = d.u16(p + 4);
+                int cb = d.u8(p + 6);
+                fl.c = cb & 3;
+                fl.flag = (cb & 4) != 0;
+            }
+            p += (int64)_spl_field_size(k);
+        }
+        o = p;
+    }
+    o = tex_at;
+    for (i in 0..s.ntex) {
+        if (!d.has(o, 0x20) || !d.magic(o, " TPS")) {
+            s.free();
+            return Err<NdsSpl, string>("spl: texture out of range");
+        }
+        NdsSplTexture* t = &s.tex[i];
+        int64 pp = d.u32(o + 4);
+        t.format = _bits(pp, 0, 4);
+        t.width = 8 << _bits(pp, 4, 4);
+        t.height = 8 << _bits(pp, 8, 4);
+        t.repeat_s = ((pp >> 12) & 1) != 0;
+        t.repeat_t = ((pp >> 13) & 1) != 0;
+        t.flip_s = ((pp >> 14) & 1) != 0;
+        t.flip_t = ((pp >> 15) & 1) != 0;
+        t.color0 = ((pp >> 16) & 1) != 0;
+        t.data = o + 0x20;
+        t.data_size = d.u32(o + 8);
+        t.palette = o + d.u32(o + 12);
+        t.palette_size = d.u32(o + 16);
+        int64 size = d.u32(o + 28);
+        if (size <= 0) {
+            s.free();
+            return Err<NdsSpl, string>("spl: bad texture size");
+        }
+        o += size;
+    }
+    return Ok<NdsSpl, string>(s);
+}
+
+// Texture i decoded to RGBA (formats as NdsTexSet_image; colors past the palette are
+// magenta).
+Result<NdsImage, string> NdsSpl_image(NdsSpl* self, int i) {
+    if (i < 0 || i >= self.ntex) return Err<NdsImage, string>("spl: no such texture");
+    NdsSplTexture* t = &self.tex[i];
+    let x: NdsTexture;
+    x.name = "";
+    x.format = t.format;
+    x.width = t.width;
+    x.height = t.height;
+    x.offset = 0;
+    x.color0 = t.color0;
+    let p: NdsTexPalette;
+    p.name = "";
+    p.offset = 0;
+    let ts: NdsTexSet;
+    ts.d = self.d;
+    ts.tex_data = t.data;
+    ts.cmp_data = t.data;
+    ts.cmp_info = t.data + t.data_size;
+    ts.pal_data = t.palette;
+    ts.pal_size = t.palette_size;
+    ts.ntex = 1;
+    ts.tex = &x;
+    ts.npal = 1;
+    ts.pal = &p;
+    return _tex_decode(&ts, 0, 0, true);
+}
+
+// ---- the Tallgrass JSON ----
+
+struct _SplKv {
+    string key;
+    String val;
+}
+
+int _spl_kv_cmp(*_SplKv a, *_SplKv b) {
+    return strcmp(a.key, b.key);
+}
+
+// An object built from keys and their written values, emitted with sorted keys.
+struct _SplObj {
+    List<_SplKv> kv;
+}
+
+void _so_init(_SplObj* o) {
+    o.kv.init(32);
+}
+
+String* _so_put(_SplObj* o, string key) {
+    let kv: _SplKv;
+    kv.key = key;
+    kv.val.init(16);
+    o.kv.push(kv);
+    return &o.kv.data[o.kv.size - 1].val;
+}
+
+void _so_int(_SplObj* o, string key, int v) {
+    if (v == 0) return;
+    _so_put(o, key).appendf("%d", v);
+}
+
+void _so_bool(_SplObj* o, string key, bool v) {
+    if (!v) return;
+    _so_put(o, key).append("true");
+}
+
+void _so_vec(_SplObj* o, string key, int* v, int n, bool keep_zero) {
+    bool any = false;
+    for (k in 0..n) {
+        if (v[k] != 0) any = true;
+    }
+    if (!any && !keep_zero) return;
+    String* s = _so_put(o, key);
+    s.push('[');
+    for (k in 0..n) {
+        if (k > 0) s.push(',');
+        s.appendf("%d", v[k]);
+    }
+    s.push(']');
+}
+
+void _so_str(_SplObj* o, string key, string v) {
+    String* s = _so_put(o, key);
+    s.push('"');
+    s.append(v);
+    s.push('"');
+}
+
+// Appends the object to out (sorted keys) and frees it.
+void _so_emit(_SplObj* o, String* out) {
+    sort<_SplKv>(o.kv.data, (int64)o.kv.size, _spl_kv_cmp);
+    out.push('{');
+    for (i in 0..o.kv.size) {
+        if (i > 0) out.push(',');
+        out.push('"');
+        out.append(o.kv.data[i].key);
+        out.append("\":");
+        out.append(o.kv.data[i].val.cstr());
+        o.kv.data[i].val.free();
+    }
+    out.push('}');
+    o.kv.free();
+}
+
+string _spl_shape_name(int s) {
+    if (s == 0) return "point";
+    if (s == 1) return "sphereSurface";
+    if (s == 2) return "circleEdge";
+    if (s == 3) return "circleEdgeEven";
+    if (s == 4) return "sphereVolume";
+    if (s == 5) return "disc";
+    if (s == 6) return "cylinderSurface";
+    if (s == 7) return "cylinderVolume";
+    if (s == 8) return "hemisphereSurface";
+    return "hemisphereVolume";
+}
+
+void _spl_emitter_json(NdsSplEmitter* e, String* out) {
+    let o: _SplObj;
+    _so_init(&o);
+    int64 f = e.flags;
+    _so_int(&o, "airResistance", e.air_resistance);
+    _so_int(&o, "aspect", e.aspect);
+    _so_vec(&o, "axis", &e.axis[0], 3, false);
+    _so_int(&o, "baseAlpha", e.base_alpha);
+    _so_int(&o, "baseScale", e.base_scale);
+    _so_bool(&o, "cameraOffset", ((f >> 23) & 1) != 0);
+    _so_bool(&o, "childPolygonIdFixed", ((f >> 31) & 1) != 0);
+    string[4] axes = {"z", "y", "x", "emitterAxis"};
+    _so_str(&o, "circleAxis", axes[e.circle_axis]);
+    _so_int(&o, "color", e.color);
+    _so_bool(&o, "directionalPolygonCenter", e.directional_polygon_center);
+    _so_int(&o, "directionalScale", e.directional_scale);
+    _so_bool(&o, "drawChildFirst", ((f >> 21) & 1) != 0);
+    _so_bool(&o, "drawParent", ((f >> 22) & 1) != 0);
+    string[4] draws = {"billboard", "directionalBillboard", "polygon", "directionalPolygon"};
+    _so_str(&o, "drawType", draws[e.draw_type]);
+    _so_str(&o, "emitShape", _spl_shape_name(e.shape));
+    _so_int(&o, "emitterLife", e.emitter_life);
+    _so_bool(&o, "followEmitter", ((f >> 15) & 1) != 0);
+    _so_int(&o, "genCount", e.gen_count);
+    _so_int(&o, "genInterval", e.gen_interval);
+    _so_int(&o, "initVelocityAlongAxis", e.init_velocity_along_axis);
+    _so_int(&o, "initVelocityFromPosition", e.init_velocity_from_position);
+    _so_int(&o, "initialRotation", e.initial_rotation);
+    _so_int(&o, "length", e.length);
+    _so_int(&o, "loopFrame", e.loop_frame);
+    _so_int(&o, "offsetMode", e.offset_mode);
+    _so_int(&o, "offsetX", e.offset_x);
+    _so_int(&o, "offsetY", e.offset_y);
+    _so_int(&o, "particleLife", e.particle_life);
+    _so_int(&o, "polygonBasePlane", _bits(f, 19, 1));
+    _so_int(&o, "polygonRotationAxis", _bits(f, 17, 2));
+    _so_vec(&o, "position", &e.position[0], 3, false);
+    _so_int(&o, "radius", e.radius);
+    _so_int(&o, "randomBaseScale", e.random_base_scale);
+    _so_int(&o, "randomInitVelocity", e.random_init_velocity);
+    _so_bool(&o, "randomInitialRotation", ((f >> 13) & 1) != 0);
+    _so_bool(&o, "randomLoopAnim", ((f >> 20) & 1) != 0);
+    _so_int(&o, "randomParticleLife", e.random_particle_life);
+    _so_bool(&o, "reverseS", e.reverse_s);
+    _so_bool(&o, "reverseT", e.reverse_t);
+    _so_bool(&o, "rotationAnim", ((f >> 12) & 1) != 0);
+    _so_int(&o, "rotationMax", e.rotation_max);
+    _so_int(&o, "rotationMin", e.rotation_min);
+    _so_int(&o, "scaleAnimDirection", e.scale_anim_direction);
+    _so_bool(&o, "selfDestroy", ((f >> 14) & 1) != 0);
+    _so_int(&o, "startFrame", e.start_frame);
+    _so_int(&o, "texture", e.texture);
+    _so_int(&o, "textureRepeatS", e.texture_repeat_s);
+    _so_int(&o, "textureRepeatT", e.texture_repeat_t);
+    _so_emit(&o, out);
+}
+
+void _spl_resource_json(NdsSplResource* r, String* out) {
+    let o: _SplObj;
+    _so_init(&o);
+    if (r.has_alpha) {
+        let a: _SplObj;
+        _so_init(&a);
+        _so_int(&a, "start", r.alpha.start);
+        _so_int(&a, "mid", r.alpha.mid);
+        _so_int(&a, "end", r.alpha.end);
+        _so_int(&a, "flick", r.alpha.flick);
+        _so_bool(&a, "loop", r.alpha.loop);
+        _so_int(&a, "inFrame", r.alpha.in_frame);
+        _so_int(&a, "outFrame", r.alpha.out_frame);
+        _so_emit(&a, _so_put(&o, "alphaAnim"));
+    }
+    if (r.has_child) {
+        NdsSplChild* c = &r.child;
+        let a: _SplObj;
+        _so_init(&a);
+        _so_bool(&a, "affectedByFields", c.affected_by_fields);
+        _so_bool(&a, "alphaAnim", c.alpha_anim);
+        _so_int(&a, "color", c.color);
+        _so_int(&a, "drawType", c.draw_type);
+        _so_int(&a, "endScale", c.end_scale);
+        _so_bool(&a, "followEmitter", c.follow_emitter);
+        _so_int(&a, "genCount", c.gen_count);
+        _so_int(&a, "genInterval", c.gen_interval);
+        _so_int(&a, "genStart", c.gen_start);
+        _so_int(&a, "initVelocityRandom", c.init_velocity_random);
+        _so_int(&a, "life", c.life);
+        _so_int(&a, "polygonBasePlane", c.polygon_base_plane);
+        _so_int(&a, "polygonRotationAxis", c.polygon_rotation_axis);
+        _so_bool(&a, "reverseS", c.reverse_s);
+        _so_bool(&a, "reverseT", c.reverse_t);
+        _so_int(&a, "rotationType", c.rotation_type);
+        _so_bool(&a, "scaleAnim", c.scale_anim);
+        _so_int(&a, "scaleRatio", c.scale_ratio);
+        _so_int(&a, "texture", c.texture);
+        _so_int(&a, "textureRepeatS", c.texture_repeat_s);
+        _so_int(&a, "textureRepeatT", c.texture_repeat_t);
+        _so_bool(&a, "useChildColor", c.use_child_color);
+        _so_int(&a, "velocityRatio", c.velocity_ratio);
+        _so_emit(&a, _so_put(&o, "child"));
+    }
+    if (r.has_color) {
+        let a: _SplObj;
+        _so_init(&a);
+        _so_int(&a, "start", r.color.start);
+        _so_int(&a, "end", r.color.end);
+        _so_int(&a, "inFrame", r.color.in_frame);
+        _so_int(&a, "peakFrame", r.color.peak_frame);
+        _so_int(&a, "outFrame", r.color.out_frame);
+        _so_bool(&a, "random", r.color.random);
+        _so_bool(&a, "loop", r.color.loop);
+        _so_bool(&a, "interpolation", r.color.interpolation);
+        _so_emit(&a, _so_put(&o, "colorAnim"));
+    }
+    _spl_emitter_json(&r.e, _so_put(&o, "emitter"));
+    if (r.nfields > 0) {
+        String* s = _so_put(&o, "fields");
+        s.push('[');
+        for (k in 0..r.nfields) {
+            NdsSplField* fl = &r.fields[k];
+            if (k > 0) s.push(',');
+            let a: _SplObj;
+            _so_init(&a);
+            if (fl.kind == SPL_FIELD_GRAVITY) {
+                _so_str(&a, "type", "gravity");
+                _so_vec(&a, "mag", &fl.vec[0], 3, true);
+            } else if (fl.kind == SPL_FIELD_RANDOM) {
+                _so_str(&a, "type", "random");
+                _so_vec(&a, "mag", &fl.vec[0], 3, true);
+                _so_put(&a, "intvl").appendf("%d", fl.a);
+            } else if (fl.kind == SPL_FIELD_MAGNET) {
+                _so_str(&a, "type", "magnet");
+                _so_vec(&a, "pos", &fl.vec[0], 3, true);
+                _so_put(&a, "mag").appendf("%d", fl.a);
+            } else if (fl.kind == SPL_FIELD_SPIN) {
+                _so_str(&a, "type", "spin");
+                _so_put(&a, "radian").appendf("%d", fl.a);
+                _so_put(&a, "axisType").appendf("%d", fl.b);
+            } else if (fl.kind == SPL_FIELD_COLLISION) {
+                _so_str(&a, "type", "collision");
+                _so_put(&a, "y").appendf("%d", fl.a);
+                _so_put(&a, "coeffBounce").appendf("%d", fl.b);
+                _so_put(&a, "eventType").appendf("%d", fl.c);
+                _so_put(&a, "global").append(fl.flag ? "true" : "false");
+            } else {
+                _so_str(&a, "type", "convergence");
+                _so_vec(&a, "pos", &fl.vec[0], 3, true);
+                _so_put(&a, "ratio").appendf("%d", fl.a);
+            }
+            _so_emit(&a, s);
+        }
+        s.push(']');
+    }
+    if (r.has_scale) {
+        let a: _SplObj;
+        _so_init(&a);
+        _so_int(&a, "start", r.scale.start);
+        _so_int(&a, "mid", r.scale.mid);
+        _so_int(&a, "end", r.scale.end);
+        _so_int(&a, "inFrame", r.scale.in_frame);
+        _so_int(&a, "outFrame", r.scale.out_frame);
+        _so_bool(&a, "loop", r.scale.loop);
+        _so_emit(&a, _so_put(&o, "scaleAnim"));
+    }
+    if (r.has_tex_anim) {
+        let a: _SplObj;
+        _so_init(&a);
+        _so_int(&a, "count", r.tex_anim.count);
+        _so_int(&a, "frameStep", r.tex_anim.frame_step);
+        _so_bool(&a, "loop", r.tex_anim.loop);
+        _so_bool(&a, "random", r.tex_anim.random);
+        _so_vec(&a, "textures", &r.tex_anim.textures[0], 8, false);
+        _so_emit(&a, _so_put(&o, "textureAnim"));
+    }
+    _so_emit(&o, out);
+}
+
+// The archive in the open particle format of the Tallgrass engine: the text of
+// NAME.json, whose textures name the images NAME_<i>.png.
+void NdsSpl_json(NdsSpl* self, string name, String* out) {
+    out.append("{\"format\":\"tallgrass-spl-1\",\"resources\":[");
+    for (i in 0..self.nres) {
+        if (i > 0) out.push(',');
+        _spl_resource_json(&self.res[i], out);
+    }
+    out.append("],\"textures\":[");
+    for (i in 0..self.ntex) {
+        NdsSplTexture* t = &self.tex[i];
+        if (i > 0) out.push(',');
+        out.appendf("{\"dsFormat\":%d,\"flipS\":%s,\"flipT\":%s,\"height\":%d,\"image\":\"%s_%d.png\",\"repeatS\":%s,\"repeatT\":%s,\"width\":%d}",
+            t.format, t.flip_s ? "true" : "false", t.flip_t ? "true" : "false", t.height, name, i,
+            t.repeat_s ? "true" : "false", t.repeat_t ? "true" : "false", t.width);
+    }
+    out.append("]}");
+}
+
+// Writes DIR/NAME.json (NdsSpl_json) and each texture as DIR/NAME_<i>.png.
+Result<int, string> NdsSpl_write_json(NdsSpl* self, string dir, string name) {
+    fs_mkdir_p(dir);
+    let j: String;
+    j.init(4096);
+    self.json(name, &j);
+    let p: String;
+    p.init(256);
+    p.appendf("%s/%s.json", dir, name);
+    int ok = fs_write_all(p.cstr(), (*uint8)j.cstr(), j.len);
+    j.free();
+    if (ok == 0) {
+        p.free();
+        return Err<int, string>("spl: cannot write the JSON file");
+    }
+    for (i in 0..self.ntex) {
+        Result<NdsImage, string> img = self.image(i);
+        if (!img.ok) {
+            p.free();
+            return Err<int, string>(img.error);
+        }
+        p.clear();
+        p.appendf("%s/%s_%d.png", dir, name, i);
+        Result<int, string> w = img.value.write_png(p.cstr());
+        img.value.free();
+        if (!w.ok) {
+            p.free();
+            return w;
+        }
+    }
+    p.free();
+    return Ok<int, string>(self.ntex);
+}
