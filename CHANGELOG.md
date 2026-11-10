@@ -3,6 +3,24 @@
 All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- `<nds/sdat>`: the synthesizer mixes a span of samples at a time (the samples up to
+  the next driver frame), voice by voice, with up to four PCM voices in one loop and
+  no per-sample end-of-wave checks where a voice cannot reach its end. The output is
+  unchanged, sample for sample, in any block size; rendering takes about 30% less time
+  (19.6 against 27.5 ns a frame on Black 2's battle themes on an Apple M-series Mac).
+
+### Added
+
+- Tools: `bench_sdat.py` with `sdat_bench.esk` and `sdat_bench.rs`, which time the
+  synthesizer against the Tallgrass engine's on the same sequences and compare a hash
+  of both outputs.
+- Tests: a synthetic sequence of five and six voice chords (`SEQ_CHORD` in
+  `test.sdat`, rendered by the engine), checked whole and in blocks of 1 to 9 frames.
+
 ## [0.2.0] - 2026-11-07
 
 ### Added
