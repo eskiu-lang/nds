@@ -28,6 +28,28 @@ On the ROMs and sound archives of three DS games:
   sound effect of the test archive renders sample for sample as the same bytecode stored
   as an SSEQ.
 
+- every NSBMD of the three ROMs (3,410 models; 1.41 million vertices, 840,000
+  triangles) converted to glTF by `<nds/gltf>` and by apicula 0.1.1-dev
+  (`tools/compare_gltf.py`): the same vertex and triangle counts for all, every vertex at
+  rest within 1/10,000 of the model's size once skinned (apicula stores weights in 8
+  bits, so a blended vertex is allowed 1/255 of its distance from the origin), and the
+  same 10,455 joints by name and rest position. Each model's joint animations from its
+  NARC were played on both skins at four frames (4,398 animations): 3,924 match; 76 have
+  a curve sampled every 2 or 4 frames, which apicula reads one sample short; 23 are
+  longer than 4,095 frames, which apicula cuts to 12 bits; 374 move a node scaled to
+  zero at rest, which apicula binds at scale 2e-6 so its vertices keep a few bits (on a
+  checked model the positions given here are the exact fixed-point values); one differs
+  by 0.2% of its model's size;
+- every BTP of the three ROMs (404) read to the same keys as Tallgrass's
+  `btp_patterns`, and the five Musical stages of Black 2 converted with their texture
+  and pattern animations: the `.patterns.json` files are identical to Tallgrass's and
+  the `.uvanims.json` files hold the same materials and frames, with offsets 128 /
+  size smaller (see [Models](models.md#gltf));
+- every SPL archive of the three ROMs (2,062: 791 in Black 2, 645 in HeartGold, 626 in
+  Platinum) converted by `<nds/spl>` and by the Tallgrass engine's `--spa-to-json`,
+  run as a black box (`tools/compare_spl.py`): all 2,062 JSON files byte for byte
+  identical and all 6,477 textures the same pixels.
+
 These scripts read the game files from paths you give them; nothing from a game is in
 this repository. The tests use synthetic files from `tools/gen_test_data.py`; the
 expected audio for them was rendered by the Tallgrass engine. On macOS the renders must
@@ -57,7 +79,9 @@ are still identical to the engine's (`tools/compare_sdat.py`).
 ## Sources
 
 The cell animation, sequence archive, stream and text readers follow these public
-descriptions; the Tallgrass tools were only run, never read.
+descriptions; the 3D animation and particle readers follow apicula's source or the
+games' files, as each entry says. The Tallgrass tools and engine were only run, never
+read.
 
 - **NANR, NMAR, NMCR:** the DS Pokémon Hacking documentation, "NANR", "ABNK section",
   "NMCR" and "MCBK section" (ds-pokemon-hacking.github.io, Nitro graphics 2D). Checked on
@@ -78,6 +102,23 @@ descriptions; the Tallgrass tools were only run, never read.
   Character table: checked with pret's `charmap.txt` (github.com/pret/pokeheartgold,
   `tools/msgenc/charmap.txt`, version 2021.08.17), loaded at run time and not shipped;
   the Gen 4 games share one character set.
+- **NSBMD nodes, materials and render commands, BCA, BTP:** apicula's source
+  (github.com/scurest/apicula, 0BSD), read as a description of the layouts. Found on
+  the games' files and done differently here: a curve's end frame has 13 bits, a curve
+  sampled every 2 or 4 frames has one more sample than its length divided by the step,
+  and the scale commands are part of the joint chains.
+- **BTA and BMA:** no description was found; the channel layouts (a constant flag, 16 or
+  32-bit samples, the sampling step and, in BMA, a 13-bit frame count beside a 16-bit
+  value or offset) were worked out from the 738 BTA and 342 BMA animations of the three
+  games, by the sizes of the sample blocks and where their values loop. Texture
+  translations are in texture units: on Black 2's Musical stage a light on a clamped
+  8-texel texture slides by a tenth of it, where apicula's reading would push it off the
+  texture.
+- **SPL:** no public description was found. The layout was worked out from the 2,062
+  archives of the three games: the size of each resource gives the size of each optional
+  block, and the values of the Tallgrass engine's JSON (its open format, run as a black
+  box on the same files) were matched with the record's bytes and bits. Its source was
+  not read.
 - **Gen 5 text:** Project Pokémon's RawDB, Black "msg" format (projectpokemon.org/rawdb/
   black/formats/msg.php): blocks, entries and the decryption from the end with a key
   turned 3 bits per character, characters as Unicode, 0xFFFE as a line break and 0xF000

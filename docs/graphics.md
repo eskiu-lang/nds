@@ -1,6 +1,7 @@
 # Graphics and textures
 
-2D graphics and animations in `<nds/graphics>`, textures and models in `<nds/model>`. Every function and type is also in the [API reference](api.md).
+2D graphics and animations in `<nds/graphics>`, textures and models in `<nds/model>`
+(skinned meshes, 3D animations, glTF and particles are in [Models](models.md)). Every function and type is also in the [API reference](api.md).
 
 ```eskiu
 NdsPalette pal = nclr_read(nclr.data, nclr.len)?;
@@ -22,6 +23,7 @@ mc.draw(0, &an, ticks, &cells, &tiles, &pal, &img, ox, oy);
 NdsTexSet ts = nds_texset(data, len)?;    // BTX0, or the TEX0 block of a BMD0
 NdsImage tex = ts.image(0, ts.palette_for(0))?;
 NdsModel m = nsbmd_read(data, len)?;      // materials and triangles
+NdsMesh mesh = m.mesh()?;                 // posed and skinned: see models.md
 ```
 
 A NANR sequence is a list of `NdsAnimFrame`s: a cell, a duration in 60 Hz ticks and the
