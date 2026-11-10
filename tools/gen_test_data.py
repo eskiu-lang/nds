@@ -6,7 +6,7 @@
 Everything is built here from fixed seeds and known values; no file comes from a game.
 
 - test.sdat: an SDAT with a wave archive (PCM8, PCM16 and IMA-ADPCM waves), a bank
-  (single, drum set and key split instruments over PCM, PSG and noise) and three
+  (single, drum set and key split instruments over PCM, PSG and noise) and four
   sequences. sdat.txt lists the names, the waves' expected PCM and the renders.
   With --ref (the Tallgrass engine's sdat_wav example), the renders are made by the
   engine and written as tests/data/*.wav: the tests compare <nds/sdat> with them.
@@ -363,6 +363,28 @@ def seq_loop():
     return s.done()
 
 
+def seq_chord():
+    """Chords of five and six voices at once: a wave that ends at a different time
+    for each key, a short loop, and PCM mixed with PSG and noise."""
+    s = Seq()
+    s.raw(0xE1)
+    s.s16(120)
+    s.raw(0xC7, 0)
+    s.prog(5)
+    for k in (48, 55, 60, 64, 67, 72):
+        s.note(k, 100, 96)
+    s.wait(96)
+    s.prog(0)
+    for k in (60, 63, 67, 70, 74):
+        s.note(k, 100, 48)
+    s.prog(1)
+    for k in (36, 37, 38, 39, 36):
+        s.note(k, 100, 48)
+    s.wait(48)
+    s.raw(0xFF)
+    return s.done()
+
+
 def seq_bad_bank():
     """A sequence whose bank slot is empty: opening it must fail."""
     s = Seq()
@@ -453,16 +475,19 @@ def gen_sdat(ref):
     waves, pcm = make_waves()
     swar = make_swar(waves)
     sbnk = make_sbnk()
-    files = [make_sseq(seq_main()), make_sseq(seq_loop()), make_sseq(seq_bad_bank()), sbnk, swar]
-    seqs = [(0, 0, 110), None, (1, 0, 127), (2, 3, 100)]
+    files = [make_sseq(seq_main()), make_sseq(seq_loop()), make_sseq(seq_bad_bank()), sbnk, swar,
+             make_sseq(seq_chord())]
+    seqs = [(0, 0, 110), None, (1, 0, 127), (2, 3, 100), (5, 0, 110)]
     banks = [(3, [0, 0xFFFF, 0xFFFF, 0xFFFF]), None, None, None]
-    sdat = make_sdat(files, seqs, banks, [4], ["SEQ_TEST", None, "SEQ_LOOP", "SEQ_NO_BANK"], ["WAVE_ARC_TEST"])
+    sdat = make_sdat(files, seqs, banks, [4], ["SEQ_TEST", None, "SEQ_LOOP", "SEQ_NO_BANK", "SEQ_CHORD"],
+                     ["WAVE_ARC_TEST"])
     write("test.sdat", sdat)
-    lines = ["# NAME index", "seq SEQ_TEST 0", "seq SEQ_LOOP 2", "seq SEQ_NO_BANK 3"]
+    lines = ["# NAME index", "seq SEQ_TEST 0", "seq SEQ_LOOP 2", "seq SEQ_NO_BANK 3", "seq SEQ_CHORD 4"]
     for k, (p, rate, looped, ls) in enumerate(pcm):
         write(f"wave{k}.pcm", b"".join(struct.pack("<h", v) for v in p))
         lines.append(f"wave {k} wave{k}.pcm {len(p)} {rate} {1 if looped else 0} {ls}")
-    renders = [("SEQ_TEST", "8", "", "seq_test.wav"), ("SEQ_LOOP", "3", "loop", "seq_loop.wav")]
+    renders = [("SEQ_TEST", "8", "", "seq_test.wav"), ("SEQ_LOOP", "3", "loop", "seq_loop.wav"),
+               ("SEQ_CHORD", "3", "", "seq_chord.wav")]
     for name, secs, loop, out in renders:
         lines.append(f"render {name} {secs} {loop or 'once'} {out}")
         if ref:

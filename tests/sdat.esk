@@ -1,7 +1,8 @@
 // The synthesizer against the Tallgrass engine's output for the synthetic
-// SDAT of tools/gen_test_data.py: names, decoded waves, two renders (one
-// that ends at the song's loop point, one that loops) compared sample by
-// sample, rendering in blocks of any size, and the errors.
+// SDAT of tools/gen_test_data.py: names, decoded waves, three renders (one
+// that ends at the song's loop point, one that loops, one of chords of five
+// and six voices) compared sample by sample, rendering in blocks of any size,
+// and the errors.
 import <io>;
 import <mem>;
 import <fs>;
@@ -66,7 +67,7 @@ int tolerance() {
 Result<int, string> run() {
     Sdat s = Sdat_open("tests/data/test.sdat")?;
     defer s.close();
-    check(s.seq_count() == 4, "four sequence slots");
+    check(s.seq_count() == 5, "five sequence slots");
     check(s.seq_find("SEQ_TEST") == 0 && s.seq_find("SEQ_LOOP") == 2 && s.seq_find("SEQ_NO_BANK") == 3, "names");
     check(s.seq_find("SEQ_NONE") == -1, "a missing name");
     check(s.seq_name(1) == null && strcmp(s.seq_name(2), "SEQ_LOOP") == 0, "seq_name");
@@ -154,6 +155,30 @@ Result<int, string> run() {
     check(d >= 0 && d <= tolerance(), "SEQ_LOOP matches the engine");
     lp.free();
     loop.free();
+
+    // chords: voices mixed four and two at a time, waves ending inside a
+    // block, in blocks of every size from 1 to 9 frames
+    Pcm16 chord;
+    s.render_name("SEQ_CHORD", 3.0, &chord)?;
+    d = compare_wav(&chord, "seq_chord.wav");
+    if (d != 0) printf("  SEQ_CHORD: largest difference %d\n", d);
+    check(d >= 0 && d <= tolerance(), "SEQ_CHORD matches the engine");
+    SdatPlayer cp = SdatPlayer_open_name(&s, "SEQ_CHORD", false)?;
+    *int16 small = alloc<int16>(chord.frames * 2 + 2);
+    int64 got_all = 0;
+    int64 size = 1;
+    while (got_all < chord.frames) {
+        int64 want = size;
+        if (want > chord.frames - got_all) want = chord.frames - got_all;
+        int64 got = cp.render(small + got_all * 2, want);
+        got_all += got;
+        if (got < want) break;
+        size = size % 9 + 1;
+    }
+    check(got_all == chord.frames && memcmp((*void)small, (*void)chord.data, got_all * 4) == 0, "SEQ_CHORD in small blocks");
+    free((*void)small);
+    cp.free();
+    chord.free();
 
     // errors
     Result<SdatPlayer, string> e = SdatPlayer_open(&s, 3, false);
