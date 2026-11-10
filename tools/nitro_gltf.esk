@@ -1,0 +1,178 @@
+// Converts NSBMD models to glTF with <nds/gltf>, and dumps models and animations for
+// tools/compare_gltf.py:
+//
+//     nitro_gltf convert OUTDIR NAME MODEL [FILES...]   MODEL to OUTDIR/NAME.gltf; FILES are
+//                                                       NSBTX and BCA, BTA, BTP, BMA files
+//                                                       (--no-pointer leaves out the
+//                                                       KHR_animation_pointer channels)
+//     nitro_gltf mesh MODEL           prints the posed mesh: counts, bounds, joints
+//     nitro_gltf anim FILE            prints every animation's values at every frame
+//
+// Each input may be LZ-compressed. The model's own TEX0 block is used when no NSBTX
+// is given.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <list>;
+import <nds/bin>;
+import <nds/lz>;
+import <nds/image>;
+import <nds/model>;
+import <nds/anim>;
+import <nds/gltf>;
+
+Result<Bytes, string> load(string path) {
+    NdsData d = nds_read_file(path)?;
+    Result<Bytes, string> b = nds_unpack(d.data, d.len);
+    free((*void)d.data);
+    return b;
+}
+
+Result<int, string> convert(int n, *string a) {
+    NdsGltfOptions opt = nds_gltf_options();
+    Bytes mb = load(a[4])?;
+    defer mb.free();
+    NdsModel m = nsbmd_read(mb.data, mb.len)?;
+    defer m.free();
+    List<Bytes> bufs;
+    bufs.init(8);
+    *NdsAnimFile anims = alloc<NdsAnimFile>((int64)n + 1);
+    int na = 0;
+    NdsTexSet ts = nds_texset(mb.data, mb.len)?;
+    bool own = true;
+    for (i in 5..n) {
+        if (strcmp(a[i], "--no-pointer") == 0) {
+            opt.pointer_anims = false;
+            continue;
+        }
+        Bytes b = load(a[i])?;
+        bufs.push(b);
+        NdsData d = NdsData{data: b.data, len: b.len};
+        if (d.magic(0, "BTX0")) {
+            ts.free();
+            ts = nds_texset(b.data, b.len)?;
+            own = false;
+        } else {
+            anims[na] = nds_anim_read(b.data, b.len)?;
+            na++;
+        }
+    }
+    Result<int, string> r = nds_gltf_write(&m, ts.ntex > 0 ? &ts : null, anims, na, a[2], a[3], &opt);
+    ts.free();
+    for (i in 0..na) anims[i].free();
+    free((*void)anims);
+    for (i in 0..bufs.size) bufs.data[i].free();
+    bufs.free();
+    int w = r?;
+    printf("%s: %d animations\n", a[3], w);
+    return Ok<int, string>(0);
+}
+
+Result<int, string> mesh(string path) {
+    Bytes mb = load(path)?;
+    defer mb.free();
+    NdsModel m = nsbmd_read(mb.data, mb.len)?;
+    defer m.free();
+    NdsMesh me = m.mesh()?;
+    defer me.free();
+    float[3] lo;
+    float[3] hi;
+    me.bounds(&lo[0], &hi[0]);
+    printf("verts %d tris %d prims %d joints %d max %d over4 %lld\n", me.verts.size, me.indices.size / 3, me.prims.size, me.joints.size, me.max_influences, me.over4);
+    printf("bounds %.6f %.6f %.6f %.6f %.6f %.6f\n", (double)lo[0], (double)lo[1], (double)lo[2], (double)hi[0], (double)hi[1], (double)hi[2]);
+    for (i in 0..me.joints.size) {
+        NdsJoint* j = &me.joints.data[i];
+        printf("joint %d %d %s %.6f %.6f %.6f\n", i, j.parent, j.kind == NDS_JOINT_NODE ? m.nodes[j.node].name : "-", j.rest.m[12], j.rest.m[13], j.rest.m[14]);
+    }
+    return Ok<int, string>(0);
+}
+
+void curve(string what, NdsCurve* c, int frames) {
+    if (c.kind == NDS_CURVE_NONE) return;
+    printf("%s", what);
+    double[9] v;
+    for (f in 0..frames) {
+        c.at((double)f, &v[0]);
+        for (k in 0..c.width) printf(" %.6f", v[k]);
+    }
+    printf("\n");
+}
+
+Result<int, string> anim(string path) {
+    Bytes b = load(path)?;
+    defer b.free();
+    NdsAnimFile a = nds_anim_read(b.data, b.len)?;
+    defer a.free();
+    for (i in 0..a.joint.size) {
+        NdsJointAnim* ja = &a.joint.data[i];
+        printf("joint %s %d %d\n", ja.name, ja.frames, ja.ntracks);
+        for (k in 0..ja.ntracks) {
+            NdsJointTrack* t = &ja.tracks[k];
+            if (!t.animated) continue;
+            printf("node %d\n", k);
+            curve("tx", &t.t[0], ja.frames);
+            curve("ty", &t.t[1], ja.frames);
+            curve("tz", &t.t[2], ja.frames);
+            curve("r", &t.r, ja.frames);
+            curve("sx", &t.s[0], ja.frames);
+            curve("sy", &t.s[1], ja.frames);
+            curve("sz", &t.s[2], ja.frames);
+        }
+    }
+    for (i in 0..a.srt.size) {
+        NdsSrtAnim* sa = &a.srt.data[i];
+        printf("srt %s %d %d\n", sa.name, sa.frames, sa.ntracks);
+        for (k in 0..sa.ntracks) {
+            NdsSrtTrack* t = &sa.tracks[k];
+            printf("material %s\n", t.material);
+            curve("ss", &t.scale_s, sa.frames);
+            curve("st", &t.scale_t, sa.frames);
+            curve("r", &t.rot, sa.frames);
+            curve("ts", &t.trans_s, sa.frames);
+            curve("tt", &t.trans_t, sa.frames);
+        }
+    }
+    for (i in 0..a.pattern.size) {
+        NdsPatternAnim* pa = &a.pattern.data[i];
+        printf("pattern %s %d %d\n", pa.name, pa.frames, pa.ntracks);
+        for (k in 0..pa.ntracks) {
+            NdsPatternTrack* t = &pa.tracks[k];
+            printf("material %s", t.material);
+            for (q in 0..t.nkeys) printf(" %d %s %s", t.keys[q].frame, pa.textures[t.keys[q].texture], t.keys[q].palette < pa.npalettes ? pa.palettes[t.keys[q].palette] : "-");
+            printf("\n");
+        }
+    }
+    for (i in 0..a.color.size) {
+        NdsColorAnim* ca = &a.color.data[i];
+        printf("color %s %d %d\n", ca.name, ca.frames, ca.ntracks);
+        for (k in 0..ca.ntracks) {
+            NdsColorTrack* t = &ca.tracks[k];
+            printf("material %s\n", t.material);
+            curve("diffuse", &t.diffuse, ca.frames);
+            curve("ambient", &t.ambient, ca.frames);
+            curve("specular", &t.specular, ca.frames);
+            curve("emission", &t.emission, ca.frames);
+            curve("alpha", &t.alpha, ca.frames);
+        }
+    }
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run(int n, *string a) {
+    if (strcmp(a[1], "convert") == 0 && n > 4) return convert(n, a);
+    if (strcmp(a[1], "mesh") == 0) return mesh(a[2]);
+    if (strcmp(a[1], "anim") == 0) return anim(a[2]);
+    return Err<int, string>("unknown command");
+}
+
+if (argc < 3) {
+    printf("usage: nitro_gltf convert OUTDIR NAME MODEL [FILES...] | mesh MODEL | anim FILE\n");
+    return 2;
+}
+Result<int, string> r = run(argc, argv);
+if (!r.ok) {
+    printf("error: %s\n", r.error);
+    return 1;
+}

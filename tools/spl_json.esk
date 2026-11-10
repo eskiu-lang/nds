@@ -1,0 +1,74 @@
+// Converts SPL particle archives with <nds/spl> to the open particle format of the
+// Tallgrass engine, as its `--spa-to-json` does, for tools/compare_spl.py:
+//
+//     spl_json IN OUTDIR      IN is a .spa file or a folder of them; each FILE.spa
+//                             becomes OUTDIR/FILE.json and OUTDIR/FILE_<i>.png
+//
+// Each input may be LZ-compressed.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <bytes>;
+import <list>;
+import <nds/bin>;
+import <nds/lz>;
+import <nds/image>;
+import <nds/spl>;
+
+Result<int, string> one(string path, string base, string out) {
+    NdsData d = nds_read_file(path)?;
+    Result<Bytes, string> b = nds_unpack(d.data, d.len);
+    free((*void)d.data);
+    Bytes data = b?;
+    defer data.free();
+    NdsSpl s = spl_read(data.data, data.len)?;
+    defer s.free();
+    let stem: String;
+    stem.init(64);
+    int64 bl = strlen(base);
+    if (bl > 4 && strcmp((string)((*uint8)base + bl - 4), ".spa") == 0) bl -= 4;
+    stem.append_bytes((*char)base, bl);
+    Result<int, string> r = s.write_json(out, stem.cstr());
+    stem.free();
+    return r;
+}
+
+if (argc < 3) {
+    printf("usage: spl_json IN OUTDIR\n");
+    return 2;
+}
+int n = 0;
+int bad = 0;
+if (fs_is_dir(argv[1]) != 0) {
+    List<String> names;
+    names.init(64);
+    fs_list_dir(argv[1], &names);
+    for (i in 0..names.size) {
+        if (names.data[i].ends_with(".spa") == 0) continue;
+        let p: String;
+        p.init(256);
+        p.appendf("%s/%s", argv[1], names.data[i].cstr());
+        Result<int, string> r = one(p.cstr(), names.data[i].cstr(), argv[2]);
+        p.free();
+        if (!r.ok) {
+            printf("%s: %s\n", names.data[i].cstr(), r.error);
+            bad++;
+        }
+        n++;
+    }
+    fs_list_free(&names);
+} else {
+    string base = argv[1];
+    for (int64 i = 0; argv[1][i] != 0; i++) {
+        if (argv[1][i] == '/') base = (string)((*uint8)argv[1] + i + 1);
+    }
+    Result<int, string> r = one(argv[1], base, argv[2]);
+    if (!r.ok) {
+        printf("%s: %s\n", argv[1], r.error);
+        bad++;
+    }
+    n++;
+}
+printf("%d particle files converted, %d failed\n", n - bad, bad);
+if (bad > 0) return 1;
