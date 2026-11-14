@@ -1,0 +1,326 @@
+// sdat_seq.esk: banks, the driver tables and the sequencer (part of sdat.esk, which imports it in order after the ones before it)
+
+// ---- banks (SBNK) ----
+
+const int _SD_PCM = 0;
+const int _SD_PSG = 1;
+const int _SD_NOISE = 2;
+
+struct _SdZone {
+    int lo;
+    int hi;
+    int wave;
+    int sample;
+    int duty;
+    int root;
+    int atk;
+    int dec;
+    int sus;
+    int rel;
+    int pan;
+}
+
+struct _SdBank {
+    List<_SdZone> zones;
+    int ninsts;
+    *int first;
+    *int count;
+    List<SdatWave> samples;
+    List<int> sample_keys;
+}
+
+void _sd_bank_free(_SdBank* b) {
+    if (b.zones.data != null) List_free<_SdZone>(&b.zones);
+    for (i in 0..b.samples.size) SdatWave_free(&b.samples.data[i]);
+    if (b.samples.data != null) List_free<SdatWave>(&b.samples);
+    if (b.sample_keys.data != null) List_free<int>(&b.sample_keys);
+    if (b.first != null) free((*void)b.first);
+    if (b.count != null) free((*void)b.count);
+    b.first = null;
+    b.count = null;
+}
+
+// The sample (swar, idx) of the bank, decoded once; -1 when it cannot be.
+int _sd_pcm(_SdBank* b, *NdsData swars, int swar, int idx) {
+    int key = (swar << 16) | idx;
+    for (i in 0..b.sample_keys.size) {
+        if (b.sample_keys.data[i] == key) return i;
+    }
+    if (swar < 0 || swar >= 4 || swars[swar].data == null) return -1;
+    Result<SdatWave, string> w = sdat_swav(swars[swar], idx);
+    if (!w.ok) return -1;
+    b.samples.push(w.value);
+    b.sample_keys.push(key);
+    return b.samples.size - 1;
+}
+
+// A note record: [kind u16 before it], swav u16, swar u16, root, attack,
+// decay, sustain, release, pan.
+void _sd_note(_SdBank* b, NdsData* d, *NdsData swars, int64 p, int kind, int lo, int hi) {
+    if (p + 10 > d.len) return;
+    int a = d.u16(p);
+    int bb = d.u16(p + 2);
+    let z: _SdZone;
+    if (kind == 1) {
+        int s = _sd_pcm(b, swars, bb, a);
+        if (s < 0) return;
+        z.wave = _SD_PCM;
+        z.sample = s;
+    } else if (kind == 2) {
+        z.wave = _SD_PSG;
+        z.duty = a & 0xFF;
+    } else if (kind == 3) {
+        z.wave = _SD_NOISE;
+    } else {
+        return;
+    }
+    z.lo = lo;
+    z.hi = hi;
+    z.root = d.u8(p + 4);
+    z.atk = d.u8(p + 5);
+    z.dec = d.u8(p + 6);
+    z.sus = d.u8(p + 7);
+    z.rel = d.u8(p + 8);
+    z.pan = d.u8(p + 9);
+    b.zones.push(z);
+}
+
+Result<_SdBank, string> _sd_load_bank(Sdat* sdat, _SdBankInfo info) {
+    let b: _SdBank;
+    NdsData d = sdat.file(info.file);
+    if (!d.magic(0, "SBNK")) return Err<_SdBank, string>("sdat: bank is not an SBNK");
+    NdsData[4] swars;
+    for (k in 0..4) {
+        int f = _sd_wavearc_file(sdat, info.wa[k]);
+        swars[k] = f < 0 ? NdsData{data: null, len: 0} : sdat.file(f);
+    }
+    b.zones.init(16);
+    b.samples.init(16);
+    b.sample_keys.init(16);
+    int64 count = d.u32(0x38);
+    int64 room = d.len > 0x3C ? (d.len - 0x3C + 3) / 4 : (int64)0;
+    if (count > room) count = room;
+    b.ninsts = (int)count;
+    b.first = alloc<int>(count + 1);
+    b.count = alloc<int>(count + 1);
+    for (int64 i = 0; i < count; i++) {
+        int64 rec = 0x3C + i * 4;
+        int kind = d.u8(rec);
+        int64 off = d.u16(rec + 1);
+        b.first[i] = b.zones.size;
+        if (kind >= 1 && kind <= 3 && off != 0) {
+            _sd_note(&b, &d, &swars[0], off, kind, 0, 127);
+        } else if (kind == 16 && off + 2 <= d.len) {
+            int lo = d.u8(off);
+            int hi = d.u8(off + 1);
+            for (int n = lo; n <= hi; n++) {
+                int64 p = off + 2 + (int64)(n - lo) * 12;
+                _sd_note(&b, &d, &swars[0], p + 2, d.u16(p) & 0xFF, n, n);
+            }
+        } else if (kind == 17 && off + 8 <= d.len) {
+            int lo = 0;
+            for (k in 0..8) {
+                int hi = d.u8(off + k);
+                if (hi == 0) break;
+                int64 p = off + 8 + (int64)k * 12;
+                _sd_note(&b, &d, &swars[0], p + 2, d.u16(p) & 0xFF, lo, hi);
+                lo = hi < 255 ? hi + 1 : 255;
+            }
+        }
+        b.count[i] = b.zones.size - b.first[i];
+    }
+    return Ok<_SdBank, string>(b);
+}
+
+// ---- driver tables ----
+
+int _sd_attack_rate(int a) {
+    if (a > 127) a = 127;
+    if (a >= 0x6D) {
+        int[19] lut = {0x00, 0x01, 0x05, 0x0E, 0x1A, 0x26, 0x33, 0x3F, 0x49, 0x54, 0x5C, 0x64, 0x6D, 0x74, 0x7B, 0x7F, 0x84, 0x89, 0x8F};
+        return lut[0x7F - a];
+    }
+    return 0xFF - a;
+}
+
+int _sd_fall_rate(int f) {
+    if (f > 127) f = 127;
+    if (f == 0x7F) return 0xFFFF;
+    if (f == 0x7E) return 0x3C00;
+    if (f < 0x32) return f * 2 + 1;
+    return 0x1E00 / (0x7E - f);
+}
+
+double _sd_note_freq(double n) {
+    return 440.0 * exp2((n - 69.0) / 12.0);
+}
+
+// ---- the sequencer ----
+
+const int _SD_ATTACK = 0;
+const int _SD_DECAY = 1;
+const int _SD_SUSTAIN = 2;
+const int _SD_RELEASE = 3;
+
+struct _SdVoice {
+    int track;
+    _SdZone zone;
+    int key;
+    int vel;
+    int length;
+    int env;
+    int ampl;
+    int attack;
+    int decay;
+    int sustain;
+    int release;
+    double pos;
+    double step;
+    float gain_l;
+    float gain_r;
+    int lfsr;
+    float noise;
+    int64 age;
+}
+
+struct _SdTrack {
+    int64 pc;
+    int wait;
+    bool ended;
+    int nstack;
+    bool[8] st_call;
+    int64[8] st_pos;
+    int[8] st_count;
+    int program;
+    int vol;
+    int expr;
+    int pan;
+    int transpose;
+    int bend;
+    int bend_range;
+    bool note_wait;
+    bool tie;
+    int atk;
+    int dec;
+    int sus;
+    int rel;
+    int mod_depth;
+    int mod_speed;
+    int mod_type;
+    int mod_range;
+    int mod_delay;
+    int mod_count;
+    int mod_phase;
+    int loops_left;
+}
+
+// A sequence being played. pitch (1/64 semitone) and pan (-127..127, added
+// to each track's) are the player's settings, as NNS_SndPlayerSet*;
+// mod_depth and mod_speed, when 0 or more, replace every track's LFO.
+struct SdatPlayer {
+    *uint8 seq;
+    int64 seq_len;
+    int64 base;
+    _SdBank bank;
+    int seq_vol;
+    int master_vol;
+    int tempo;
+    int tempo_acc;
+    List<_SdTrack> tracks;
+    _SdVoice[32] voices;
+    int nvoices;
+    int[32] vars;
+    bool cond;
+    uint32 rng;
+    double frame_left;
+    int64 age;
+    bool done;
+    int pitch;
+    int pan;
+    int mod_depth;
+    int mod_speed;
+    int[128] db;
+    int[128] sine;
+}
+
+_SdTrack _sd_track(int64 pc, int loops) {
+    let t: _SdTrack;
+    t.pc = pc;
+    t.vol = 127;
+    t.expr = 127;
+    t.pan = 64;
+    t.bend_range = 2;
+    t.note_wait = true;
+    t.atk = 0xFF;
+    t.dec = 0xFF;
+    t.sus = 0xFF;
+    t.rel = 0xFF;
+    t.mod_speed = 16;
+    t.mod_range = 1;
+    t.loops_left = loops;
+    return t;
+}
+
+int _sd_seq_byte(*uint8 seq, int64 len, int64 i) {
+    return i >= 0 && i < len ? (int)seq[i] : 0;
+}
+
+// Opens sequence i. A player that does not loop ends at the song's first
+// jump back (as music effects and sound effects do); one that loops plays on.
+Result<SdatPlayer, string> SdatPlayer_open(Sdat* sdat, int i, bool looping) {
+    if (!sdat.has_seq(i)) return Err<SdatPlayer, string>("sdat: no such sequence");
+    _SdSeqInfo info = sdat.seqs[i];
+    NdsData f = sdat.file(info.file);
+    if (!f.magic(0, "SSEQ")) return Err<SdatPlayer, string>("sdat: sequence is not an SSEQ");
+    return _sd_player(sdat, f, 0, info.bank, info.vol, looping);
+}
+
+// A player over the bytecode of file f (an SSEQ or an SSAR, its data offset
+// at 0x18) starting start bytes into the data.
+Result<SdatPlayer, string> _sd_player(Sdat* sdat, NdsData f, int64 start, int bank_id, int vol, bool looping) {
+    if (bank_id < 0 || bank_id >= sdat.nbanks || !sdat.banks[bank_id].present) {
+        return Err<SdatPlayer, string>("sdat: the sequence's bank is missing");
+    }
+    Result<_SdBank, string> bank = _sd_load_bank(sdat, sdat.banks[bank_id]);
+    if (!bank.ok) return Err<SdatPlayer, string>(bank.error);
+    let p: SdatPlayer;
+    p.seq = alloc<uint8>(f.len + 1);
+    memcpy((*void)p.seq, (*void)f.data, f.len);
+    p.seq_len = f.len;
+    p.base = f.u32(0x18);
+    p.bank = bank.value;
+    p.seq_vol = vol;
+    p.master_vol = 127;
+    p.tempo = 120;
+    p.cond = true;
+    p.rng = (uint32)0x12345678;
+    p.mod_depth = -1;
+    p.mod_speed = -1;
+    p.db[0] = -32768;
+    for (k in 1..128) p.db[k] = (int)round(200.0 * log10((double)k / 127.0));
+    for (k in 0..128) p.sine[k] = (int)round(127.0 * sin(6.283185307179586 * (double)k / 128.0));
+    int loops = looping ? -1 : 0;
+    p.tracks.init(16);
+    int64 pc = p.base + start;
+    if (_sd_seq_byte(p.seq, p.seq_len, pc) == 0xFE) pc += 3;
+    List<int64> starts;
+    starts.init(16);
+    while (pc < p.seq_len && p.seq[pc] == 0x93) {
+        int64 off = (int64)_sd_seq_byte(p.seq, p.seq_len, pc + 2) | ((int64)_sd_seq_byte(p.seq, p.seq_len, pc + 3) << 8) | ((int64)_sd_seq_byte(p.seq, p.seq_len, pc + 4) << 16);
+        starts.push(p.base + off);
+        pc += 5;
+    }
+    p.tracks.push(_sd_track(pc, loops));
+    for (k in 0..starts.size) {
+        if (p.tracks.size < _SD_MAX_TRACKS) p.tracks.push(_sd_track(starts.data[k], loops));
+    }
+    starts.free();
+    return Ok<SdatPlayer, string>(p);
+}
+
+// Opens the sequence named name.
+Result<SdatPlayer, string> SdatPlayer_open_name(Sdat* sdat, string name, bool looping) {
+    int i = sdat.seq_find(name);
+    if (i < 0) return Err<SdatPlayer, string>("sdat: no sequence with that name");
+    return SdatPlayer_open(sdat, i, looping);
+}

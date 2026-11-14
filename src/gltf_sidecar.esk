@@ -1,0 +1,124 @@
+// gltf_sidecar.esk: the JSON files next to the model (part of gltf.esk, which imports it in order after the ones before it)
+
+// The JSON side files: the first SRT, pattern and color animation found.
+Result<int, string> _gl_sidecars(NdsModel* m, NdsTexSet* ts, NdsAnimFile* anims, int nanims, String* dir, string name, List<_GlImage>* imgs) {
+    NdsSrtAnim* sa = null;
+    NdsPatternAnim* pa = null;
+    NdsColorAnim* ca = null;
+    for (a in 0..nanims) {
+        if (sa == null && anims[a].srt.size > 0) sa = &anims[a].srt.data[0];
+        if (pa == null && anims[a].pattern.size > 0) pa = &anims[a].pattern.data[0];
+        if (ca == null && anims[a].color.size > 0) ca = &anims[a].color.data[0];
+    }
+    if (sa != null && sa.frames > 0) {
+        let j: _Jw;
+        _jw_init(&j);
+        _jw_open(&j, '{');
+        for (k in 0..sa.ntracks) {
+            NdsSrtTrack* tr = &sa.tracks[k];
+            if (tr.trans_s.kind != NDS_CURVE_SAMPLES && tr.trans_t.kind != NDS_CURVE_SAMPLES) continue;
+            _jw_key(&j, tr.material);
+            _jw_open(&j, '{');
+            _jw_key(&j, "times");
+            _jw_open(&j, '[');
+            for (f in 0..sa.frames) _jw_num(&j, (double)f / 60.0);
+            _jw_close(&j, ']');
+            _jw_key(&j, "offsets");
+            _jw_open(&j, '[');
+            for (f in 0..sa.frames) {
+                double[2] off;
+                double[2] sc;
+                double r = 0.0;
+                _srt_at(tr, (double)f, &off[0], &sc[0], &r);
+                _jw_open(&j, '[');
+                _jw_num(&j, off[0]);
+                _jw_num(&j, off[1]);
+                _jw_close(&j, ']');
+            }
+            _jw_close(&j, ']');
+            _jw_close(&j, '}');
+        }
+        _jw_close(&j, '}');
+        Result<int, string> r = _gl_write_text(dir, name, ".uvanims.json", &j.s);
+        j.s.free();
+        r?;
+    }
+    if (pa != null && ts != null) {
+        let j: _Jw;
+        _jw_init(&j);
+        _jw_open(&j, '{');
+        _jw_key(&j, "frames");
+        _jw_int(&j, (int64)pa.frames);
+        _jw_key(&j, "materials");
+        _jw_open(&j, '{');
+        for (k in 0..pa.ntracks) {
+            NdsPatternTrack* tr = &pa.tracks[k];
+            _jw_key(&j, tr.material);
+            _jw_open(&j, '[');
+            for (q in 0..tr.nkeys) {
+                NdsPatternKey* key = &tr.keys[q];
+                int t = ts.find(pa.textures[key.texture]);
+                if (t < 0) continue;
+                int p = key.palette < pa.npalettes ? ts.find_palette(pa.palettes[key.palette]) : -1;
+                if (ts.tex[t].format == NDS_TEX_DIRECT) p = -1;
+                int im = _gl_image(imgs, ts, t, p);
+                _jw_open(&j, '[');
+                _jw_int(&j, (int64)key.frame);
+                _jw_str(&j, imgs.data[im].file.cstr());
+                _jw_str(&j, key.palette < pa.npalettes ? pa.palettes[key.palette] : "");
+                _jw_close(&j, ']');
+            }
+            _jw_close(&j, ']');
+        }
+        _jw_close(&j, '}');
+        _jw_close(&j, '}');
+        Result<int, string> r = _gl_write_text(dir, name, ".patterns.json", &j.s);
+        j.s.free();
+        r?;
+    }
+    if (ca != null && ca.frames > 0) {
+        let j: _Jw;
+        _jw_init(&j);
+        _jw_open(&j, '{');
+        _jw_key(&j, "frames");
+        _jw_int(&j, (int64)ca.frames);
+        _jw_key(&j, "materials");
+        _jw_open(&j, '{');
+        for (k in 0..ca.ntracks) {
+            NdsColorTrack* tr = &ca.tracks[k];
+            _jw_key(&j, tr.material);
+            _jw_open(&j, '{');
+            _gl_color_channel(&j, "diffuse", &tr.diffuse, ca.frames);
+            _gl_color_channel(&j, "ambient", &tr.ambient, ca.frames);
+            _gl_color_channel(&j, "specular", &tr.specular, ca.frames);
+            _gl_color_channel(&j, "emission", &tr.emission, ca.frames);
+            _gl_color_channel(&j, "alpha", &tr.alpha, ca.frames);
+            _jw_close(&j, '}');
+        }
+        _jw_close(&j, '}');
+        _jw_close(&j, '}');
+        Result<int, string> r = _gl_write_text(dir, name, ".matanims.json", &j.s);
+        j.s.free();
+        r?;
+    }
+    return Ok<int, string>(0);
+}
+
+void _gl_color_channel(_Jw* j, string key, NdsCurve* c, int frames) {
+    if (c.kind == NDS_CURVE_NONE) return;
+    _jw_key(j, key);
+    _jw_open(j, '[');
+    int n = c.kind == NDS_CURVE_CONST ? 1 : frames;
+    double[3] v;
+    for (f in 0..n) {
+        c.at((double)f, &v[0]);
+        if (c.width == 1) {
+            _jw_num(j, v[0]);
+        } else {
+            _jw_open(j, '[');
+            for (k in 0..c.width) _jw_num(j, v[k]);
+            _jw_close(j, ']');
+        }
+    }
+    _jw_close(j, ']');
+}

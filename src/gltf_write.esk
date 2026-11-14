@@ -1,0 +1,739 @@
+// gltf_write.esk: the glTF writer (part of gltf.esk, which imports it in order after the ones before it)
+
+// Writes model m as DIR/NAME.gltf with NAME.bin, its PNGs and (opt.sidecars) the JSON
+// side files. ts gives the textures (null for none); anims holds nanims animation
+// files whose animations are added: joint animations whose track count is the model's
+// node count, and the material animations of materials found by name. Returns the
+// number of animations written.
+Result<int, string> nds_gltf_write(NdsModel* m, NdsTexSet* ts, NdsAnimFile* anims, int nanims, string dir, string name, NdsGltfOptions* opt) {
+    NdsMesh mesh = m.mesh()?;
+    defer mesh.free();
+    let dirs: String;
+    dirs.init(256);
+    dirs.append(dir);
+    defer dirs.free();
+    fs_mkdir_p(dir);
+    let g: _Gltf;
+    g.bin.init(65536);
+    _jw_init(&g.views);
+    _jw_init(&g.accessors);
+    g.nviews = 0;
+    g.naccessors = 0;
+    defer {
+        g.bin.free();
+        g.views.s.free();
+        g.accessors.s.free();
+    }
+    List<_GlImage> imgs;
+    imgs.init(16);
+    defer {
+        for (i in 0..imgs.size) imgs.data[i].file.free();
+        imgs.free();
+    }
+    // which materials SRT and color animations touch (for their pointer targets)
+    *bool srt_mat = alloc<bool>((int64)m.nmaterials + 1);
+    defer free((*void)srt_mat);
+    for (a in 0..nanims) {
+        for (i in 0..anims[a].srt.size) {
+            NdsSrtAnim* sa = &anims[a].srt.data[i];
+            for (k in 0..sa.ntracks) {
+                int mi = _gl_find_material(m, sa.tracks[k].material);
+                if (mi >= 0) srt_mat[mi] = true;
+            }
+        }
+    }
+    // ---- mesh ----
+    int nv = mesh.verts.size;
+    bool any_uv = false;
+    bool any_n = false;
+    bool any_c = false;
+    for (i in 0..mesh.prims.size) {
+        if (mesh.prims.data[i].has_uv) any_uv = true;
+        if (mesh.prims.data[i].has_normals) any_n = true;
+        if (mesh.prims.data[i].has_colors) any_c = true;
+    }
+    int a_pos = -1;
+    int a_uv = -1;
+    int a_n = -1;
+    int a_c = -1;
+    int a_j = -1;
+    int a_w = -1;
+    if (nv > 0) {
+        *double tmp = alloc<double>((int64)nv * 4 + 1);
+        for (i in 0..nv) {
+            for (k in 0..3) tmp[i * 3 + k] = (double)mesh.verts.data[i].pos[k];
+        }
+        a_pos = _gl_floats(&g, tmp, (int64)nv, 3, "VEC3", true);
+        if (any_uv) {
+            for (i in 0..nv) {
+                for (k in 0..2) tmp[i * 2 + k] = (double)mesh.verts.data[i].uv[k];
+            }
+            a_uv = _gl_floats(&g, tmp, (int64)nv, 2, "VEC2", false);
+        }
+        if (any_n) {
+            for (i in 0..nv) {
+                for (k in 0..3) tmp[i * 3 + k] = (double)mesh.verts.data[i].normal[k];
+            }
+            a_n = _gl_floats(&g, tmp, (int64)nv, 3, "VEC3", false);
+        }
+        if (any_c) {
+            for (i in 0..nv) {
+                for (k in 0..3) tmp[i * 3 + k] = _srgb_linear((double)mesh.verts.data[i].color[k]);
+            }
+            a_c = _gl_floats(&g, tmp, (int64)nv, 3, "VEC3", false);
+        }
+        for (i in 0..nv) {
+            for (k in 0..4) tmp[i * 4 + k] = (double)mesh.verts.data[i].weights[k];
+        }
+        a_w = _gl_floats(&g, tmp, (int64)nv, 4, "VEC4", false);
+        free((*void)tmp);
+        int64 start = g.bin.len;
+        bool wide = mesh.joints.size > 255;
+        for (i in 0..nv) {
+            for (k in 0..4) {
+                int jj = mesh.verts.data[i].joints[k];
+                if (wide) {
+                    _bin_u16(&g.bin, jj);
+                } else {
+                    g.bin.push((uint8)jj);
+                }
+            }
+        }
+        int jv = _gl_view(&g, start, 0, 34962);
+        a_j = _gl_accessor(&g, jv, 0, wide ? 5123 : 5121, (int64)nv, "VEC4", false, null, null, 0);
+    }
+    bool idx32 = nv > 65535;
+    int64 istart = g.bin.len;
+    for (i in 0..mesh.indices.size) {
+        if (idx32) {
+            _bin_u32(&g.bin, (int64)mesh.indices.data[i]);
+        } else {
+            _bin_u16(&g.bin, mesh.indices.data[i]);
+        }
+    }
+    int iview = _gl_view(&g, istart, 0, 34963);
+    let doc: _Jw;
+    _jw_init(&doc);
+    defer doc.s.free();
+    let prims: _Jw;
+    _jw_init(&prims);
+    defer prims.s.free();
+    for (i in 0..mesh.prims.size) {
+        NdsPrim* pr = &mesh.prims.data[i];
+        if (pr.count == 0) continue;
+        int ia = _gl_accessor(&g, iview, (int64)pr.first * (idx32 ? 4 : 2), idx32 ? 5125 : 5123, (int64)pr.count, "SCALAR", false, null, null, 0);
+        _jw_open(&prims, '{');
+        _jw_key(&prims, "attributes");
+        _jw_open(&prims, '{');
+        _jw_key(&prims, "POSITION");
+        _jw_int(&prims, (int64)a_pos);
+        if (a_uv >= 0) {
+            _jw_key(&prims, "TEXCOORD_0");
+            _jw_int(&prims, (int64)a_uv);
+        }
+        if (a_n >= 0) {
+            _jw_key(&prims, "NORMAL");
+            _jw_int(&prims, (int64)a_n);
+        }
+        if (a_c >= 0) {
+            _jw_key(&prims, "COLOR_0");
+            _jw_int(&prims, (int64)a_c);
+        }
+        _jw_key(&prims, "JOINTS_0");
+        _jw_int(&prims, (int64)a_j);
+        _jw_key(&prims, "WEIGHTS_0");
+        _jw_int(&prims, (int64)a_w);
+        _jw_close(&prims, '}');
+        _jw_key(&prims, "indices");
+        _jw_int(&prims, (int64)ia);
+        if (pr.material >= 0) {
+            _jw_key(&prims, "material");
+            _jw_int(&prims, (int64)pr.material);
+        }
+        _jw_close(&prims, '}');
+    }
+    // ---- materials, textures, samplers ----
+    let mats: _Jw;
+    _jw_init(&mats);
+    defer mats.s.free();
+    let texs: _Jw;
+    _jw_init(&texs);
+    defer texs.s.free();
+    let samps: _Jw;
+    _jw_init(&samps);
+    defer samps.s.free();
+    int ntex = 0;
+    for (mi in 0..m.nmaterials) {
+        NdsMaterial* mt = &m.materials[mi];
+        int t = -1;
+        int p = -1;
+        _gl_mat_texture(m, ts, mi, &t, &p);
+        _jw_open(&mats, '{');
+        _jw_key(&mats, "name");
+        _jw_str(&mats, mt.name);
+        _jw_key(&mats, "pbrMetallicRoughness");
+        _jw_open(&mats, '{');
+        double alpha = (double)mt.alpha / 31.0;
+        bool dif = !mt.diffuse_is_vertex_color && mt.diffuse != 0x7FFF;
+        _jw_key(&mats, "baseColorFactor");
+        _jw_open(&mats, '[');
+        for (k in 0..3) _jw_num(&mats, dif ? (double)((mt.diffuse >> (k * 5)) & 31) / 31.0 : 1.0);
+        _jw_num(&mats, alpha);
+        _jw_close(&mats, ']');
+        _jw_key(&mats, "metallicFactor");
+        _jw_num(&mats, 0.0);
+        if (t >= 0) {
+            int img = _gl_image(&imgs, ts, t, p);
+            int64 tp = mt.tex_params;
+            int ws = ((tp >> 16) & 1) == 0 ? 33071 : (((tp >> 18) & 1) != 0 ? 33648 : 10497);
+            int wt = ((tp >> 17) & 1) == 0 ? 33071 : (((tp >> 19) & 1) != 0 ? 33648 : 10497);
+            _jw_open(&samps, '{');
+            _jw_key(&samps, "magFilter");
+            _jw_int(&samps, 9728);
+            _jw_key(&samps, "minFilter");
+            _jw_int(&samps, 9728);
+            _jw_key(&samps, "wrapS");
+            _jw_int(&samps, (int64)ws);
+            _jw_key(&samps, "wrapT");
+            _jw_int(&samps, (int64)wt);
+            _jw_close(&samps, '}');
+            _jw_open(&texs, '{');
+            _jw_key(&texs, "sampler");
+            _jw_int(&texs, (int64)ntex);
+            _jw_key(&texs, "source");
+            _jw_int(&texs, (int64)img);
+            _jw_close(&texs, '}');
+            _jw_key(&mats, "baseColorTexture");
+            _jw_open(&mats, '{');
+            _jw_key(&mats, "index");
+            _jw_int(&mats, (int64)ntex);
+            if (srt_mat[mi] && opt.pointer_anims) {
+                _jw_key(&mats, "extensions");
+                _jw_open(&mats, '{');
+                _jw_key(&mats, "KHR_texture_transform");
+                _jw_raw(&mats, "{\"offset\":[0.0,0.0],\"rotation\":0.0,\"scale\":[1.0,1.0]}");
+                _jw_close(&mats, '}');
+            }
+            _jw_close(&mats, '}');
+            ntex++;
+        }
+        _jw_close(&mats, '}');
+        int fmt = t >= 0 ? ts.tex[t].format : 0;
+        string mode = null;
+        if (fmt == NDS_TEX_A3I5 || fmt == NDS_TEX_A5I3 || (mt.alpha > 0 && mt.alpha < 31)) {
+            mode = "BLEND";
+        } else if (mt.alpha == 0 || fmt == NDS_TEX_4X4 || fmt == NDS_TEX_DIRECT || (t >= 0 && ts.tex[t].color0)) {
+            mode = "MASK";
+        }
+        if (mode != null) {
+            _jw_key(&mats, "alphaMode");
+            _jw_str(&mats, mode);
+        }
+        if (!mt.cull_back) {
+            _jw_key(&mats, "doubleSided");
+            _jw_bool(&mats, true);
+        }
+        if (mt.emission != 0) {
+            _jw_key(&mats, "emissiveFactor");
+            _jw_open(&mats, '[');
+            for (k in 0..3) _jw_num(&mats, (double)((mt.emission >> (k * 5)) & 31) / 31.0);
+            _jw_close(&mats, ']');
+        }
+        _jw_key(&mats, "extensions");
+        _jw_raw(&mats, "{\"KHR_materials_unlit\":{}}");
+        _jw_close(&mats, '}');
+    }
+    // pattern animation images
+    for (a in 0..nanims) {
+        for (i in 0..anims[a].pattern.size) {
+            NdsPatternAnim* pa = &anims[a].pattern.data[i];
+            for (k in 0..pa.ntracks) {
+                for (q in 0..pa.tracks[k].nkeys) {
+                    NdsPatternKey* key = &pa.tracks[k].keys[q];
+                    if (ts == null) continue;
+                    int t = ts.find(pa.textures[key.texture]);
+                    if (t < 0) continue;
+                    int p = key.palette < pa.npalettes ? ts.find_palette(pa.palettes[key.palette]) : -1;
+                    if (ts.tex[t].format == NDS_TEX_DIRECT) p = -1;
+                    _gl_image(&imgs, ts, t, p);
+                }
+            }
+        }
+    }
+    if (opt.all_textures && ts != null) {
+        for (t in 0..ts.ntex) {
+            bool seen = false;
+            for (i in 0..imgs.size) {
+                if (imgs.data[i].tex == t) seen = true;
+            }
+            if (!seen) _gl_image(&imgs, ts, t, ts.tex[t].format == NDS_TEX_DIRECT ? -1 : m.palette_for(ts, t));
+        }
+    }
+    // ---- nodes and skin ----
+    int nj = mesh.joints.size;
+    let nodes: _Jw;
+    _jw_init(&nodes);
+    defer nodes.s.free();
+    for (i in 0..nj) {
+        NdsJoint* jt = &mesh.joints.data[i];
+        _jw_open(&nodes, '{');
+        _jw_key(&nodes, "name");
+        if (jt.kind == NDS_JOINT_NODE) {
+            _jw_str(&nodes, m.nodes[jt.node].name);
+        } else {
+            _jw_str(&nodes, jt.kind == NDS_JOINT_ROOT ? "<root>" : "<constant>");
+        }
+        bool kids = false;
+        for (c in 0..nj) {
+            if (mesh.joints.data[c].parent != i) continue;
+            if (!kids) {
+                _jw_key(&nodes, "children");
+                _jw_open(&nodes, '[');
+                kids = true;
+            }
+            _jw_int(&nodes, (int64)c);
+        }
+        if (kids) _jw_close(&nodes, ']');
+        if (jt.kind == NDS_JOINT_NODE) {
+            NdsNode* nd = &m.nodes[jt.node];
+            if (nd.has_t) {
+                _jw_key(&nodes, "translation");
+                _jw_open(&nodes, '[');
+                for (k in 0..3) _jw_num(&nodes, nd.t[k]);
+                _jw_close(&nodes, ']');
+            }
+            if (nd.has_r) {
+                double[4] q;
+                _quat(&nd.r[0], &q[0]);
+                _jw_key(&nodes, "rotation");
+                _jw_open(&nodes, '[');
+                for (k in 0..4) _jw_num(&nodes, q[k]);
+                _jw_close(&nodes, ']');
+            }
+            if (nd.has_s) {
+                _jw_key(&nodes, "scale");
+                _jw_open(&nodes, '[');
+                for (k in 0..3) _jw_num(&nodes, fabs(nd.s[k]) < 0.000002 ? (nd.s[k] < 0.0 ? -0.000002 : 0.000002) : nd.s[k]);
+                _jw_close(&nodes, ']');
+            }
+        } else if (jt.kind == NDS_JOINT_CONST) {
+            _jw_key(&nodes, "matrix");
+            _jw_open(&nodes, '[');
+            for (k in 0..16) _jw_num(&nodes, jt.local.m[k]);
+            _jw_close(&nodes, ']');
+        }
+        _jw_close(&nodes, '}');
+    }
+    int a_ib = -1;
+    if (nj > 0) {
+        *double ib = alloc<double>((int64)nj * 16 + 1);
+        for (i in 0..nj) {
+            for (k in 0..16) ib[i * 16 + k] = mesh.joints.data[i].inv_bind.m[k];
+        }
+        a_ib = _gl_floats(&g, ib, (int64)nj, 16, "MAT4", false);
+        free((*void)ib);
+    }
+    // the mesh node, parent of the top joints
+    _jw_open(&nodes, '{');
+    _jw_key(&nodes, "name");
+    _jw_str(&nodes, m.name);
+    if (prims.s.len > 0) {
+        _jw_key(&nodes, "mesh");
+        _jw_int(&nodes, 0);
+        if (nj > 0) {
+            _jw_key(&nodes, "skin");
+            _jw_int(&nodes, 0);
+        }
+    }
+    bool kids = false;
+    int top = -1;
+    int ntop = 0;
+    for (c in 0..nj) {
+        if (mesh.joints.data[c].parent >= 0) continue;
+        if (!kids) {
+            _jw_key(&nodes, "children");
+            _jw_open(&nodes, '[');
+            kids = true;
+        }
+        _jw_int(&nodes, (int64)c);
+        top = c;
+        ntop++;
+    }
+    if (kids) _jw_close(&nodes, ']');
+    _jw_close(&nodes, '}');
+    // ---- animations ----
+    let anim: _Jw;
+    _jw_init(&anim);
+    defer anim.s.free();
+    List<int> times;
+    times.init(8);
+    defer times.free();
+    int written = 0;
+    bool used_pointer = false;
+    bool used_tt = false;
+    for (a in 0..nanims) {
+        for (i in 0..anims[a].joint.size) {
+            NdsJointAnim* ja = &anims[a].joint.data[i];
+            if (ja.ntracks != m.nnodes || ja.frames <= 0) continue;
+            let ch: _Jw;
+            _jw_init(&ch);
+            let sm: _Jw;
+            _jw_init(&sm);
+            int ns = 0;
+            int fr = ja.frames;
+            int ti = _gl_times(&g, &times, fr);
+            *double buf = alloc<double>((int64)fr * 4 + 1);
+            for (j in 0..nj) {
+                NdsJoint* jt = &mesh.joints.data[j];
+                if (jt.kind != NDS_JOINT_NODE) continue;
+                NdsJointTrack* tr = &ja.tracks[jt.node];
+                NdsNode* nd = &m.nodes[jt.node];
+                if (!tr.animated) continue;
+                bool has_t = false;
+                bool has_s = false;
+                for (k in 0..3) {
+                    if (tr.t[k].kind != NDS_CURVE_NONE) has_t = true;
+                    if (tr.s[k].kind != NDS_CURVE_NONE) has_s = true;
+                }
+                if (has_t) {
+                    for (f in 0..fr) {
+                        double[3] v = {nd.t[0], nd.t[1], nd.t[2]};
+                        tr.t_at((double)f, &v[0]);
+                        for (k in 0..3) buf[f * 3 + k] = v[k];
+                    }
+                    int o = _gl_floats(&g, buf, (int64)fr, 3, "VEC3", false);
+                    _gl_sampler(&sm, ti, o);
+                    _gl_channel_node(&ch, ns, j, "translation");
+                    ns++;
+                }
+                if (tr.r.kind != NDS_CURVE_NONE) {
+                    double[9] r;
+                    double[4] q;
+                    for (f in 0..fr) {
+                        tr.r.at((double)f, &r[0]);
+                        _quat(&r[0], &q[0]);
+                        if (f > 0) {
+                            double dot = 0.0;
+                            for (k in 0..4) dot += q[k] * buf[(f - 1) * 4 + k];
+                            if (dot < 0.0) {
+                                for (k in 0..4) q[k] = 0.0 - q[k];
+                            }
+                        }
+                        for (k in 0..4) buf[f * 4 + k] = q[k];
+                    }
+                    int o = _gl_floats(&g, buf, (int64)fr, 4, "VEC4", false);
+                    _gl_sampler(&sm, ti, o);
+                    _gl_channel_node(&ch, ns, j, "rotation");
+                    ns++;
+                }
+                if (has_s) {
+                    for (f in 0..fr) {
+                        double[3] v = {nd.s[0], nd.s[1], nd.s[2]};
+                        tr.s_at((double)f, &v[0]);
+                        for (k in 0..3) buf[f * 3 + k] = fabs(v[k]) < 0.000002 ? (v[k] < 0.0 ? -0.000002 : 0.000002) : v[k];
+                    }
+                    int o = _gl_floats(&g, buf, (int64)fr, 3, "VEC3", false);
+                    _gl_sampler(&sm, ti, o);
+                    _gl_channel_node(&ch, ns, j, "scale");
+                    ns++;
+                }
+            }
+            free((*void)buf);
+            if (ns > 0) {
+                _jw_open(&anim, '{');
+                _jw_key(&anim, "name");
+                _jw_str(&anim, ja.name);
+                _jw_key(&anim, "channels");
+                _jw_open(&anim, '[');
+                _jw_raw(&anim, ch.s.cstr());
+                _jw_close(&anim, ']');
+                _jw_key(&anim, "samplers");
+                _jw_open(&anim, '[');
+                _jw_raw(&anim, sm.s.cstr());
+                _jw_close(&anim, ']');
+                _jw_close(&anim, '}');
+                written++;
+            }
+            ch.s.free();
+            sm.s.free();
+        }
+        if (!opt.pointer_anims) continue;
+        for (i in 0..anims[a].srt.size) {
+            NdsSrtAnim* sa = &anims[a].srt.data[i];
+            if (sa.frames <= 0) continue;
+            let ch: _Jw;
+            _jw_init(&ch);
+            let sm: _Jw;
+            _jw_init(&sm);
+            int ns = 0;
+            int fr = sa.frames;
+            int ti = _gl_times(&g, &times, fr);
+            *double buf = alloc<double>((int64)fr * 2 + 1);
+            *double buf2 = alloc<double>((int64)fr * 2 + 1);
+            *double buf3 = alloc<double>((int64)fr + 1);
+            for (k in 0..sa.ntracks) {
+                NdsSrtTrack* tr = &sa.tracks[k];
+                int mi = _gl_find_material(m, tr.material);
+                if (mi < 0) continue;
+                int t = -1;
+                int p = -1;
+                _gl_mat_texture(m, ts, mi, &t, &p);
+                if (t < 0) continue;
+                for (f in 0..fr) {
+                    double r = 0.0;
+                    _srt_at(tr, (double)f, buf + f * 2, buf2 + f * 2, &r);
+                    buf3[f] = r;
+                }
+                let ptr: String;
+                ptr.init(128);
+                if (tr.trans_s.kind == NDS_CURVE_SAMPLES || tr.trans_t.kind == NDS_CURVE_SAMPLES) {
+                    int o = _gl_floats(&g, buf, (int64)fr, 2, "VEC2", false);
+                    _gl_sampler(&sm, ti, o);
+                    ptr.appendf("/materials/%d/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform/offset", mi);
+                    _gl_channel_pointer(&ch, ns, ptr.cstr());
+                    ns++;
+                }
+                if (tr.scale_s.kind == NDS_CURVE_SAMPLES || tr.scale_t.kind == NDS_CURVE_SAMPLES) {
+                    int o = _gl_floats(&g, buf2, (int64)fr, 2, "VEC2", false);
+                    _gl_sampler(&sm, ti, o);
+                    ptr.clear();
+                    ptr.appendf("/materials/%d/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform/scale", mi);
+                    _gl_channel_pointer(&ch, ns, ptr.cstr());
+                    ns++;
+                }
+                if (tr.rot.kind == NDS_CURVE_SAMPLES) {
+                    int o = _gl_floats(&g, buf3, (int64)fr, 1, "SCALAR", false);
+                    _gl_sampler(&sm, ti, o);
+                    ptr.clear();
+                    ptr.appendf("/materials/%d/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform/rotation", mi);
+                    _gl_channel_pointer(&ch, ns, ptr.cstr());
+                    ns++;
+                }
+                ptr.free();
+            }
+            free((*void)buf);
+            free((*void)buf2);
+            free((*void)buf3);
+            if (ns > 0) {
+                _jw_open(&anim, '{');
+                _jw_key(&anim, "name");
+                _jw_str(&anim, sa.name);
+                _jw_key(&anim, "channels");
+                _jw_open(&anim, '[');
+                _jw_raw(&anim, ch.s.cstr());
+                _jw_close(&anim, ']');
+                _jw_key(&anim, "samplers");
+                _jw_open(&anim, '[');
+                _jw_raw(&anim, sm.s.cstr());
+                _jw_close(&anim, ']');
+                _jw_close(&anim, '}');
+                written++;
+                used_pointer = true;
+                used_tt = true;
+            }
+            ch.s.free();
+            sm.s.free();
+        }
+        for (i in 0..anims[a].color.size) {
+            NdsColorAnim* ca = &anims[a].color.data[i];
+            if (ca.frames <= 0) continue;
+            let ch: _Jw;
+            _jw_init(&ch);
+            let sm: _Jw;
+            _jw_init(&sm);
+            int ns = 0;
+            int fr = ca.frames;
+            int ti = _gl_times(&g, &times, fr);
+            *double buf = alloc<double>((int64)fr * 4 + 1);
+            for (k in 0..ca.ntracks) {
+                NdsColorTrack* tr = &ca.tracks[k];
+                int mi = _gl_find_material(m, tr.material);
+                if (mi < 0) continue;
+                NdsMaterial* mt = &m.materials[mi];
+                let ptr: String;
+                ptr.init(128);
+                if (tr.diffuse.kind == NDS_CURVE_SAMPLES || tr.alpha.kind == NDS_CURVE_SAMPLES) {
+                    for (f in 0..fr) {
+                        double[3] c;
+                        for (q in 0..3) c[q] = (double)((mt.diffuse >> (q * 5)) & 31) / 31.0;
+                        double[1] al = {(double)mt.alpha / 31.0};
+                        tr.diffuse.at((double)f, &c[0]);
+                        tr.alpha.at((double)f, &al[0]);
+                        for (q in 0..3) buf[f * 4 + q] = mt.diffuse_is_vertex_color ? 1.0 : c[q];
+                        buf[f * 4 + 3] = al[0];
+                    }
+                    int o = _gl_floats(&g, buf, (int64)fr, 4, "VEC4", false);
+                    _gl_sampler(&sm, ti, o);
+                    ptr.appendf("/materials/%d/pbrMetallicRoughness/baseColorFactor", mi);
+                    _gl_channel_pointer(&ch, ns, ptr.cstr());
+                    ns++;
+                }
+                if (tr.emission.kind == NDS_CURVE_SAMPLES) {
+                    for (f in 0..fr) tr.emission.at((double)f, buf + f * 3);
+                    int o = _gl_floats(&g, buf, (int64)fr, 3, "VEC3", false);
+                    _gl_sampler(&sm, ti, o);
+                    ptr.clear();
+                    ptr.appendf("/materials/%d/emissiveFactor", mi);
+                    _gl_channel_pointer(&ch, ns, ptr.cstr());
+                    ns++;
+                }
+                ptr.free();
+            }
+            free((*void)buf);
+            if (ns > 0) {
+                _jw_open(&anim, '{');
+                _jw_key(&anim, "name");
+                _jw_str(&anim, ca.name);
+                _jw_key(&anim, "channels");
+                _jw_open(&anim, '[');
+                _jw_raw(&anim, ch.s.cstr());
+                _jw_close(&anim, ']');
+                _jw_key(&anim, "samplers");
+                _jw_open(&anim, '[');
+                _jw_raw(&anim, sm.s.cstr());
+                _jw_close(&anim, ']');
+                _jw_close(&anim, '}');
+                written++;
+                used_pointer = true;
+            }
+            ch.s.free();
+            sm.s.free();
+        }
+    }
+    // ---- the document ----
+    _jw_open(&doc, '{');
+    _jw_key(&doc, "asset");
+    _jw_raw(&doc, "{\"generator\":\"eskiu nds\",\"version\":\"2.0\"}");
+    _jw_key(&doc, "extensionsUsed");
+    _jw_open(&doc, '[');
+    _jw_str(&doc, "KHR_materials_unlit");
+    if (used_tt) _jw_str(&doc, "KHR_texture_transform");
+    if (used_pointer) _jw_str(&doc, "KHR_animation_pointer");
+    _jw_close(&doc, ']');
+    _jw_key(&doc, "scene");
+    _jw_int(&doc, 0);
+    _jw_key(&doc, "scenes");
+    _jw_open(&doc, '[');
+    _jw_open(&doc, '{');
+    _jw_key(&doc, "name");
+    _jw_str(&doc, m.name);
+    _jw_key(&doc, "nodes");
+    _jw_open(&doc, '[');
+    _jw_int(&doc, (int64)nj);
+    _jw_close(&doc, ']');
+    _jw_close(&doc, '}');
+    _jw_close(&doc, ']');
+    _jw_key(&doc, "nodes");
+    _jw_open(&doc, '[');
+    _jw_raw(&doc, nodes.s.cstr());
+    _jw_close(&doc, ']');
+    if (prims.s.len > 0) {
+        _jw_key(&doc, "meshes");
+        _jw_open(&doc, '[');
+        _jw_open(&doc, '{');
+        _jw_key(&doc, "name");
+        _jw_str(&doc, m.name);
+        _jw_key(&doc, "primitives");
+        _jw_open(&doc, '[');
+        _jw_raw(&doc, prims.s.cstr());
+        _jw_close(&doc, ']');
+        _jw_close(&doc, '}');
+        _jw_close(&doc, ']');
+    }
+    if (nj > 0 && prims.s.len > 0) {
+        _jw_key(&doc, "skins");
+        _jw_open(&doc, '[');
+        _jw_open(&doc, '{');
+        _jw_key(&doc, "inverseBindMatrices");
+        _jw_int(&doc, (int64)a_ib);
+        _jw_key(&doc, "joints");
+        _jw_open(&doc, '[');
+        for (i in 0..nj) _jw_int(&doc, (int64)i);
+        _jw_close(&doc, ']');
+        if (ntop == 1) {
+            _jw_key(&doc, "skeleton");
+            _jw_int(&doc, (int64)top);
+        }
+        _jw_close(&doc, '}');
+        _jw_close(&doc, ']');
+    }
+    if (m.nmaterials > 0) {
+        _jw_key(&doc, "materials");
+        _jw_open(&doc, '[');
+        _jw_raw(&doc, mats.s.cstr());
+        _jw_close(&doc, ']');
+    }
+    if (ntex > 0) {
+        _jw_key(&doc, "textures");
+        _jw_open(&doc, '[');
+        _jw_raw(&doc, texs.s.cstr());
+        _jw_close(&doc, ']');
+        _jw_key(&doc, "samplers");
+        _jw_open(&doc, '[');
+        _jw_raw(&doc, samps.s.cstr());
+        _jw_close(&doc, ']');
+    }
+    if (imgs.size > 0) {
+        _jw_key(&doc, "images");
+        _jw_open(&doc, '[');
+        for (i in 0..imgs.size) {
+            _jw_open(&doc, '{');
+            _jw_key(&doc, "uri");
+            _jw_str(&doc, imgs.data[i].file.cstr());
+            _jw_close(&doc, '}');
+        }
+        _jw_close(&doc, ']');
+    }
+    if (anim.s.len > 0) {
+        _jw_key(&doc, "animations");
+        _jw_open(&doc, '[');
+        _jw_raw(&doc, anim.s.cstr());
+        _jw_close(&doc, ']');
+    }
+    if (g.naccessors > 0) {
+        _jw_key(&doc, "accessors");
+        _jw_open(&doc, '[');
+        _jw_raw(&doc, g.accessors.s.cstr());
+        _jw_close(&doc, ']');
+    }
+    if (g.nviews > 0) {
+        _jw_key(&doc, "bufferViews");
+        _jw_open(&doc, '[');
+        _jw_raw(&doc, g.views.s.cstr());
+        _jw_close(&doc, ']');
+    }
+    let bin_name: String;
+    bin_name.init(64);
+    bin_name.append(name);
+    bin_name.append(".bin");
+    defer bin_name.free();
+    _jw_key(&doc, "buffers");
+    _jw_open(&doc, '[');
+    _jw_open(&doc, '{');
+    _jw_key(&doc, "byteLength");
+    _jw_int(&doc, g.bin.len);
+    _jw_key(&doc, "uri");
+    _jw_str(&doc, bin_name.cstr());
+    _jw_close(&doc, '}');
+    _jw_close(&doc, ']');
+    _jw_close(&doc, '}');
+    _gl_write_text(&dirs, name, ".gltf", &doc.s)?;
+    let bp: String;
+    bp.init(256);
+    bp.appendf("%s/%s.bin", dir, name);
+    int ok = fs_write_all(bp.cstr(), g.bin.data, g.bin.len);
+    bp.free();
+    if (ok == 0) return Err<int, string>("gltf: cannot write the buffer");
+    for (i in 0..imgs.size) {
+        NdsImage img = ts.image(imgs.data[i].tex, imgs.data[i].pal)?;
+        let ip: String;
+        ip.init(256);
+        ip.appendf("%s/%s", dir, imgs.data[i].file.cstr());
+        Result<int, string> w = img.write_png(ip.cstr());
+        ip.free();
+        img.free();
+        if (!w.ok) return w;
+    }
+    if (opt.sidecars) _gl_sidecars(m, ts, anims, nanims, &dirs, name, &imgs)?;
+    return Ok<int, string>(written);
+}
