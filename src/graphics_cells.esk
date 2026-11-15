@@ -1,0 +1,187 @@
+// graphics_cells.esk: cells (NCER) (part of graphics.esk, which imports it in order after the ones before it)
+
+// ---- cells (NCER) ----
+
+// One OAM object of a cell. x and y are relative to the cell's origin (for
+// a double-size affine object, of its tiles, half the object inside the box
+// the hardware draws).
+struct NdsOam {
+    int x;
+    int y;
+    int w;
+    int h;
+    int tile;
+    int palette;
+    bool hflip;
+    bool vflip;
+    bool affine;
+    bool double_size;
+    int mode;
+    int priority;
+    bool bpp8;
+}
+
+// The cells of an NCER: cell i is the objects oams[first[i] .. first[i] + n[i]) (read them
+// with oam()), and `mapping` the tile mapping (see ncer_read). Free with free().
+struct NdsCells {
+    int count;
+    *int first;
+    *int n;
+    List<NdsOam> oams;
+    int mapping;
+}
+
+// Frees the cells and their objects.
+void NdsCells_free(NdsCells* self) {
+    if (self.first != null) free((*void)self.first);
+    if (self.n != null) free((*void)self.n);
+    if (self.oams.data != null) List_free<NdsOam>(&self.oams);
+    self.first = null;
+    self.n = null;
+    self.count = 0;
+}
+
+int[12] _G2D_OAM_W = {8, 16, 32, 64, 16, 32, 32, 64, 8, 8, 16, 32};
+int[12] _G2D_OAM_H = {8, 16, 32, 64, 8, 8, 16, 32, 16, 32, 32, 64};
+
+// An NCER (RECN) file: its cells and their OAM objects. mapping is the
+// file's tile mapping (0 to 3: 1D with 32, 64, 128 or 256 KB boundaries; 4:
+// 2D).
+Result<NdsCells, string> ncer_read(*uint8 data, int64 len) {
+    NdsData d = NdsData{data: data, len: len};
+    if (!d.magic(0, "RECN")) return Err<NdsCells, string>("ncer: not an NCER file");
+    int64 sec = nds_section(&d, "KBEC");
+    if (sec < 0) return Err<NdsCells, string>("ncer: no KBEC block");
+    int64 s = sec + 8;
+    let c: NdsCells;
+    int n = d.u16(s);
+    int bank = d.u16(s + 2);
+    int64 off = d.u32(s + 4);
+    c.mapping = (int)d.u32(s + 8);
+    int64 ent = bank == 1 ? (int64)16 : (int64)8;
+    int64 base = s + off;
+    int64 oam = base + (int64)n * ent;
+    if (!d.has(base, (int64)n * ent)) return Err<NdsCells, string>("ncer: cells out of range");
+    c.count = n;
+    c.first = alloc<int>((int64)n + 1);
+    c.n = alloc<int>((int64)n + 1);
+    c.oams.init(16);
+    for (i in 0..n) {
+        int cnt = d.u16(base + (int64)i * ent);
+        int64 oo = d.u32(base + (int64)i * ent + 4);
+        c.first[i] = c.oams.size;
+        if (!d.has(oam + oo, (int64)cnt * 6)) {
+            NdsCells_free(&c);
+            return Err<NdsCells, string>("ncer: objects out of range");
+        }
+        for (k in 0..cnt) {
+            int64 p = oam + oo + (int64)k * 6;
+            int a0 = d.u16(p);
+            int a1 = d.u16(p + 2);
+            int a2 = d.u16(p + 4);
+            let o: NdsOam;
+            o.y = a0 & 0xFF;
+            if (o.y >= 128) o.y -= 256;
+            o.x = a1 & 0x1FF;
+            if (o.x >= 256) o.x -= 512;
+            int shape = (a0 >> 14) & 3;
+            int size = (a1 >> 14) & 3;
+            if (shape == 3) shape = 0;
+            o.w = _G2D_OAM_W[shape * 4 + size];
+            o.h = _G2D_OAM_H[shape * 4 + size];
+            o.tile = a2 & 0x3FF;
+            o.palette = (a2 >> 12) & 15;
+            o.priority = (a2 >> 10) & 3;
+            o.affine = (a0 & 0x100) != 0;
+            o.double_size = o.affine && (a0 & 0x200) != 0;
+            o.mode = (a0 >> 10) & 3;
+            o.bpp8 = (a0 & 0x2000) != 0;
+            o.hflip = !o.affine && (a1 & 0x1000) != 0;
+            o.vflip = !o.affine && (a1 & 0x2000) != 0;
+            if (o.double_size) {
+                o.x += o.w / 2;
+                o.y += o.h / 2;
+            }
+            c.oams.push(o);
+        }
+        c.n[i] = cnt;
+    }
+    return Ok<NdsCells, string>(c);
+}
+
+// Object k of cell `cell` (no bounds check: k must be below n[cell]).
+NdsOam* NdsCells_oam(NdsCells* self, int cell, int k) {
+    return &self.oams.data[self.first[cell] + k];
+}
+
+// The color index of pixel (x, y) of object o, from tiled or linear tiles.
+int _g2d_oam_index(NdsCells* c, NdsOam* o, NdsTiles* t, int x, int y) {
+    if (t.linear) {
+        // an atlas bitmap: the tile number is a position in it, row by row
+        int cols = t.tiles_w > 0 ? t.tiles_w : 32;
+        int64 px = (int64)(o.tile % cols) * 8 + (int64)x;
+        int64 py = (int64)(o.tile / cols) * 8 + (int64)y;
+        int64 w = (int64)cols * 8;
+        if (px >= w) return 0;
+        int64 i = py * w + px;
+        if (i >= (int64)t.count * 64) return 0;
+        return (int)t.pix[i];
+    }
+    int tx = x / 8;
+    int ty = y / 8;
+    int tile = 0;
+    int unit = o.bpp8 || t.bpp == 8 ? 2 : 1;
+    if (c.mapping == 4) {
+        tile = (o.tile + ty * 32 + tx * unit) / unit;
+    } else {
+        tile = ((o.tile << (c.mapping & 3)) + (ty * (o.w / 8) + tx) * unit) / unit;
+    }
+    return t.index(tile, x % 8, y % 8);
+}
+
+// Draws cell i onto dst with the cell's origin at (ox, oy): its objects from
+// the last to the first, so the first is on top. Index 0 is transparent.
+void NdsCells_draw(NdsCells* self, int cell, NdsTiles* tiles, NdsPalette* pal, NdsImage* dst, int ox, int oy) {
+    if (cell < 0 || cell >= self.count) return;
+    for (int k = self.n[cell] - 1; k >= 0; k--) {
+        NdsOam* o = self.oam(cell, k);
+        for (y in 0..o.h) {
+            for (x in 0..o.w) {
+                int c = _g2d_oam_index(self, o, tiles, x, y);
+                if (c == 0) continue;
+                int dx = o.hflip ? o.w - 1 - x : x;
+                int dy = o.vflip ? o.h - 1 - y : y;
+                int pi = tiles.bpp == 4 && !o.bpp8 ? o.palette * 16 + c : c;
+                _g2d_put(dst, ox + o.x + dx, oy + o.y + dy, pal, pi);
+            }
+        }
+    }
+}
+
+// The bounding box of cell i's objects around its origin.
+void NdsCells_bounds(NdsCells* self, int cell, *int x0, *int y0, *int x1, *int y1) {
+    *x0 = 0;
+    *y0 = 0;
+    *x1 = 0;
+    *y1 = 0;
+    if (cell < 0 || cell >= self.count) return;
+    for (k in 0..self.n[cell]) {
+        NdsOam* o = self.oam(cell, k);
+        if (k == 0 || o.x < *x0) *x0 = o.x;
+        if (k == 0 || o.y < *y0) *y0 = o.y;
+        if (k == 0 || o.x + o.w > *x1) *x1 = o.x + o.w;
+        if (k == 0 || o.y + o.h > *y1) *y1 = o.y + o.h;
+    }
+}
+
+// Cell i alone, cropped to its objects.
+NdsImage NdsCells_render(NdsCells* self, int cell, NdsTiles* tiles, NdsPalette* pal) {
+    int x0 = 0;
+    int y0 = 0;
+    int x1 = 0;
+    int y1 = 0;
+    self.bounds(cell, &x0, &y0, &x1, &y1);
+    NdsImage img = NdsImage_new(x1 - x0, y1 - y0);
+    self.draw(cell, tiles, pal, &img, -x0, -y0);
+    return img;
+}

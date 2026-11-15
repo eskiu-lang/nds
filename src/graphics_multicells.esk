@@ -1,0 +1,130 @@
+// graphics_multicells.esk: multi-cells (NMCR) (part of graphics.esk, which imports it in order after the ones before it)
+
+// ---- multi-cells (NMCR) ----
+
+// One cell of a multi-cell: it plays sequence seq of the cells' NANR with
+// its origin at (x, y). mode is the record's play flags (0x20 restarts the
+// sequence when the multi-cell is shown again, 0x21 keeps its time) and
+// anim the animation slot it plays in (nodes may share one).
+struct NdsMcNode {
+    int seq;
+    int x;
+    int y;
+    int mode;
+    int anim;
+}
+
+// The multi-cells of an NMCR: multi-cell i has n[i] nodes from nodes[first[i]] (read them
+// with node()) and uses nanims[i] animation slots. Free with free().
+struct NdsMultiCells {
+    int count;
+    *int first;
+    *int n;
+    *int nanims;
+    List<NdsMcNode> nodes;
+}
+
+// Frees the multi-cells and their nodes.
+void NdsMultiCells_free(NdsMultiCells* self) {
+    if (self.first != null) free((*void)self.first);
+    if (self.n != null) free((*void)self.n);
+    if (self.nanims != null) free((*void)self.nanims);
+    if (self.nodes.data != null) List_free<NdsMcNode>(&self.nodes);
+    self.first = null;
+    self.n = null;
+    self.nanims = null;
+    self.count = 0;
+}
+
+// An NMCR (RCMN) file: its multi-cells and their nodes.
+Result<NdsMultiCells, string> nmcr_read(*uint8 data, int64 len) {
+    NdsData d = NdsData{data: data, len: len};
+    if (!d.magic(0, "RCMN")) return Err<NdsMultiCells, string>("nmcr: not an NMCR file");
+    int64 sec = nds_section(&d, "KBCM");
+    if (sec < 0) return Err<NdsMultiCells, string>("nmcr: no MCBK block");
+    int64 s = sec + 8;
+    if (!d.has(s, 12)) return Err<NdsMultiCells, string>("nmcr: truncated MCBK block");
+    int n = d.u16(s);
+    int64 recs = s + d.u32(s + 4);
+    int64 props = s + d.u32(s + 8);
+    if (!d.has(recs, (int64)n * 8)) return Err<NdsMultiCells, string>("nmcr: multi-cells out of range");
+    let m: NdsMultiCells;
+    m.count = n;
+    m.first = alloc<int>((int64)n + 1);
+    m.n = alloc<int>((int64)n + 1);
+    m.nanims = alloc<int>((int64)n + 1);
+    m.nodes.init(16);
+    for (i in 0..n) {
+        int64 r = recs + (int64)i * 8;
+        int cnt = d.u16(r);
+        int64 no = props + d.u32(r + 4);
+        if (!d.has(no, (int64)cnt * 8)) {
+            NdsMultiCells_free(&m);
+            return Err<NdsMultiCells, string>("nmcr: nodes out of range");
+        }
+        m.first[i] = m.nodes.size;
+        m.n[i] = cnt;
+        m.nanims[i] = d.u16(r + 2);
+        for (k in 0..cnt) {
+            int64 p = no + (int64)k * 8;
+            m.nodes.push(NdsMcNode{seq: d.u16(p), x: d.s16(p + 2), y: d.s16(p + 4), mode: d.u8(p + 6), anim: d.u8(p + 7)});
+        }
+    }
+    return Ok<NdsMultiCells, string>(m);
+}
+
+// Node k of multi-cell mc (no bounds check: k must be below n[mc]).
+NdsMcNode* NdsMultiCells_node(NdsMultiCells* self, int mc, int k) {
+    return &self.nodes.data[self.first[mc] + k];
+}
+
+// The frame node k of multi-cell mc shows tick ticks in, from the cells'
+// NANR anims, or null.
+NdsAnimFrame* NdsMultiCells_node_frame(NdsMultiCells* self, int mc, int k, NdsAnims* anims, int64 tick) {
+    if (mc < 0 || mc >= self.count || k < 0 || k >= self.n[mc]) return null;
+    int seq = self.node(mc, k).seq;
+    return anims.frame(seq, anims.frame_at(seq, tick));
+}
+
+// The box of multi-cell mc around its origin, tick ticks in (within 1024
+// pixels of it).
+void NdsMultiCells_bounds(NdsMultiCells* self, int mc, NdsAnims* anims, int64 tick, NdsCells* cells, *int x0, *int y0, *int x1, *int y1) {
+    *x0 = 0;
+    *y0 = 0;
+    *x1 = 0;
+    *y1 = 0;
+    if (mc < 0 || mc >= self.count) return;
+    bool any = false;
+    for (k in 0..self.n[mc]) {
+        NdsAnimFrame* f = self.node_frame(mc, k, anims, tick);
+        if (f == null) continue;
+        NdsMcNode* nd = self.node(mc, k);
+        int a0 = 0;
+        int b0 = 0;
+        int a1 = 0;
+        int b1 = 0;
+        cells.frame_bounds(f, &a0, &b0, &a1, &b1);
+        a0 = _g2d_clamp(a0 + nd.x);
+        b0 = _g2d_clamp(b0 + nd.y);
+        a1 = _g2d_clamp(a1 + nd.x);
+        b1 = _g2d_clamp(b1 + nd.y);
+        if (!any || a0 < *x0) *x0 = a0;
+        if (!any || b0 < *y0) *y0 = b0;
+        if (!any || a1 > *x1) *x1 = a1;
+        if (!any || b1 > *y1) *y1 = b1;
+        any = true;
+    }
+}
+
+// Draws multi-cell mc tick ticks in, with its origin at (ox, oy): each node
+// draws the frame its sequence shows then, the last node first so the first
+// is on top.
+void NdsMultiCells_draw(NdsMultiCells* self, int mc, NdsAnims* anims, int64 tick, NdsCells* cells, NdsTiles* tiles, NdsPalette* pal, NdsImage* dst, int ox, int oy) {
+    if (mc < 0 || mc >= self.count) return;
+    for (int k = self.n[mc] - 1; k >= 0; k--) {
+        NdsAnimFrame* f = self.node_frame(mc, k, anims, tick);
+        if (f == null) continue;
+        NdsMcNode* nd = self.node(mc, k);
+        cells.draw_frame(f, tiles, pal, dst, ox + nd.x, oy + nd.y);
+    }
+}
