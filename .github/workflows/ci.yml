@@ -33,27 +33,6 @@ jobs:
           mkdir -p build
           for f in examples/*.esk; do eskiuc "$f" -o build/$(basename "$f" .esk); done
 
-  macos:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Eskiu
-        run: brew install eskiu-lang/eskiu/eskiu
-      - name: Tests
-        run: eskiuc test
-      - name: Tests (-O2)
-        run: eskiuc test -O2
-      - name: PNG output read by Python
-        run: |
-          mkdir -p build/png
-          eskiuc examples/nds_textures.esk -o build/nds_textures
-          build/nds_textures tests/data/test.nsbtx build/png
-          python3 -I tools/check_png.py build/png
-      - name: Examples build
-        run: |
-          mkdir -p build
-          for f in examples/*.esk; do eskiuc "$f" -o build/$(basename "$f" .esk); done
-
   windows:
     runs-on: windows-latest
     defaults:

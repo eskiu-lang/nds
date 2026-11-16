@@ -1,0 +1,31 @@
+# The macOS jobs, apart from CI: the org's macOS runners can take long to start, and a
+# job that waits too long is cancelled; here that does not mark CI failed.
+name: macOS
+on:
+  # once per change: develop (main and the tags only get commits that already ran here)
+  push:
+    branches: [develop]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu
+        run: brew install eskiu-lang/eskiu/eskiu
+      - name: Tests
+        run: eskiuc test
+      - name: Tests (-O2)
+        run: eskiuc test -O2
+      - name: PNG output read by Python
+        run: |
+          mkdir -p build/png
+          eskiuc examples/nds_textures.esk -o build/nds_textures
+          build/nds_textures tests/data/test.nsbtx build/png
+          python3 -I tools/check_png.py build/png
+      - name: Examples build
+        run: |
+          mkdir -p build
+          for f in examples/*.esk; do eskiuc "$f" -o build/$(basename "$f" .esk); done
