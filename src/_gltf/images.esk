@@ -1,4 +1,4 @@
-// gltf_images.esk: images, rotations, animation samplers and tracks (part of gltf.esk, which imports it in order after the ones before it)
+// _gltf/images.esk: images, rotations, animation samplers and tracks (part of gltf.esk, which imports it in order after the ones before it)
 
 // ---- images ----
 

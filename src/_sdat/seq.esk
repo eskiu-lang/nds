@@ -1,4 +1,4 @@
-// sdat_seq.esk: banks, the driver tables and the sequencer (part of sdat.esk, which imports it in order after the ones before it)
+// _sdat/seq.esk: banks, the driver tables and the sequencer (part of sdat.esk, which imports it in order after the ones before it)
 
 // ---- banks (SBNK) ----
 

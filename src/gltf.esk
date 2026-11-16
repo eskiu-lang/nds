@@ -248,6 +248,6 @@ int _gl_floats(_Gltf* g, double* vals, int64 n, int w, string type, bool minmax)
     return _gl_accessor(g, v, 0, 5126, n, type, false, &lo[0], &hi[0], w);
 }
 
-import "gltf_images.esk";
-import "gltf_write.esk";
-import "gltf_sidecar.esk";
+import "_gltf/images.esk";
+import "_gltf/write.esk";
+import "_gltf/sidecar.esk";

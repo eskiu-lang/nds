@@ -602,6 +602,6 @@ Result<SdatStream, string> Sdat_stream(Sdat* self, int i) {
     return Ok<SdatStream, string>(s);
 }
 
-import "sdat_seq.esk";
-import "sdat_player.esk";
-import "sdat_mix.esk";
+import "_sdat/seq.esk";
+import "_sdat/player.esk";
+import "_sdat/mix.esk";

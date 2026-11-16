@@ -1,4 +1,4 @@
-// graphics_cells.esk: cells (NCER) (part of graphics.esk, which imports it in order after the ones before it)
+// _graphics/cells.esk: cells (NCER) (part of graphics.esk, which imports it in order after the ones before it)
 
 // ---- cells (NCER) ----
 

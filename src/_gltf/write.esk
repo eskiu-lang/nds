@@ -1,4 +1,4 @@
-// gltf_write.esk: the glTF writer (part of gltf.esk, which imports it in order after the ones before it)
+// _gltf/write.esk: the glTF writer (part of gltf.esk, which imports it in order after the ones before it)
 
 // Writes model m as DIR/NAME.gltf with NAME.bin, its PNGs and (opt.sidecars) the JSON
 // side files. ts gives the textures (null for none); anims holds nanims animation

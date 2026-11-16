@@ -1,4 +1,4 @@
-// sdat_mix.esk: mixing the voices and rendering sequences (part of sdat.esk, which imports it in order after the ones before it)
+// _sdat/mix.esk: mixing the voices and rendering sequences (part of sdat.esk, which imports it in order after the ones before it)
 
 // The voices are mixed a span at a time: the samples up to the next driver
 // frame, where no setting changes. Each voice adds its whole span to a stereo

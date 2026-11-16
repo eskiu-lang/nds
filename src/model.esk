@@ -395,6 +395,6 @@ Result<NdsImage, string> _tex_decode(NdsTexSet* self, int tex, int pal, bool rnd
     return Ok<NdsImage, string>(img);
 }
 
-import "model_nsbmd.esk";
-import "model_gpu.esk";
-import "model_mesh.esk";
+import "_model/nsbmd.esk";
+import "_model/gpu.esk";
+import "_model/mesh.esk";

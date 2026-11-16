@@ -1,4 +1,4 @@
-// graphics_anims.esk: cell animations (NANR, NMAR) (part of graphics.esk, which imports it in order after the ones before it)
+// _graphics/anims.esk: cell animations (NANR, NMAR) (part of graphics.esk, which imports it in order after the ones before it)
 
 // ---- cell animations (NANR, NMAR) ----
 

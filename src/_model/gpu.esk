@@ -1,4 +1,4 @@
-// model_gpu.esk: material names and the GPU command stream (part of model.esk, which imports it in order after the ones before it)
+// _model/gpu.esk: material names and the GPU command stream (part of model.esk, which imports it in order after the ones before it)
 
 // Names the texture (or palette) of each material from a pairing
 // dictionary: each entry lists the materials that use that name.

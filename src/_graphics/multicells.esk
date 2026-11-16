@@ -1,4 +1,4 @@
-// graphics_multicells.esk: multi-cells (NMCR) (part of graphics.esk, which imports it in order after the ones before it)
+// _graphics/multicells.esk: multi-cells (NMCR) (part of graphics.esk, which imports it in order after the ones before it)
 
 // ---- multi-cells (NMCR) ----
 

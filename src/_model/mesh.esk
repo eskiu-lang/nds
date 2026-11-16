@@ -1,4 +1,4 @@
-// model_mesh.esk: posed and skinned meshes (part of model.esk, which imports it in order after the ones before it)
+// _model/mesh.esk: posed and skinned meshes (part of model.esk, which imports it in order after the ones before it)
 
 // ---- posed and skinned meshes ----
 

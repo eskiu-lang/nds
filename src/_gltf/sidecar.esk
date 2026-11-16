@@ -1,4 +1,4 @@
-// gltf_sidecar.esk: the JSON files next to the model (part of gltf.esk, which imports it in order after the ones before it)
+// _gltf/sidecar.esk: the JSON files next to the model (part of gltf.esk, which imports it in order after the ones before it)
 
 // The JSON side files: the first SRT, pattern and color animation found.
 Result<int, string> _gl_sidecars(NdsModel* m, NdsTexSet* ts, NdsAnimFile* anims, int nanims, String* dir, string name, List<_GlImage>* imgs) {

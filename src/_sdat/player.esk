@@ -1,4 +1,4 @@
-// sdat_player.esk: sequence archives (SSAR) and the player (part of sdat.esk, which imports it in order after the ones before it)
+// _sdat/player.esk: sequence archives (SSAR) and the player (part of sdat.esk, which imports it in order after the ones before it)
 
 // ---- sequence archives (SSAR) ----
 

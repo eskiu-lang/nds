@@ -268,6 +268,6 @@ NdsImage nds_render_screen(NdsScreen* scr, NdsTiles* tiles, NdsPalette* pal, boo
     return img;
 }
 
-import "graphics_cells.esk";
-import "graphics_anims.esk";
-import "graphics_multicells.esk";
+import "_graphics/cells.esk";
+import "_graphics/anims.esk";
+import "_graphics/multicells.esk";
